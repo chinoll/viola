@@ -115,6 +115,27 @@ E5M2 × E4M3 乘法，复用前向保存的权重和输入。`backward_dtype` �
 `scaling="current"/"delayed"`、`history_len=16`。默认 per-tensor current scaling。
 W 与 W.T 共享一个 FP32 scale。已有层用 `viola.nn.Linear.from_float(nn_linear, ...)` 转换。
 
+用 `autotune=True` 为实际矩阵形状搜索 GEMM 配置：
+
+```python
+layer = viola.nn.Linear(4096, 16384, mode="memory", autotune=True,
+                        device="cuda", dtype=torch.bfloat16)
+```
+
+前向、dX、dW 根据各自的矩阵形状和 FP8 类型分别搜索分块、线程数、流水线深度，
+候选配置与 FP32 参考计算核对后才参与选择。配置按 GPU 型号、形状、类型、工具链和
+kernel 源码缓存到 `~/.cache/viola/linear/`，后续运行直接加载。累加精度仍为 FP32。
+默认不开启搜索；首次使用新形状时会编译并计时，使用 CUDA Graph 前先完成普通前后向预热。
+
+训练前可单独预调优 4 倍扩展 MLP 所需的全部 GEMM：
+
+```bash
+TILELANG_AUTO_TUNING_CPU_COUNTS=4 PYTHONPATH=. python checks/autotune_linear.py \
+  --tokens 16384 --hidden 4096 --expansion 4
+
+PYTHONPATH=. python checks/benchmark_mlp.py --tokens 16384 --autotune
+```
+
 ## 精度策略与主权重
 
 ```python

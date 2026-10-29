@@ -55,7 +55,7 @@ def _scale_kernel(n, history_len, fp8_max, delayed):
 
 @tilelang.jit
 def _quantize_kernel(rows, cols, dtype, fp8_dtype, rowwise, transpose):
-    block = 32
+    block = 64
     fp8_max = 448.0 if fp8_dtype == "float8_e4m3" else 57344.0
 
     @T.prim_func
@@ -64,6 +64,10 @@ def _quantize_kernel(rows, cols, dtype, fp8_dtype, rowwise, transpose):
                qt: T.Tensor((cols, rows) if transpose else (0, 0), fp8_dtype)):
         with T.Kernel(T.ceildiv(cols, block), T.ceildiv(rows, block), threads=128) as (bc, br):
             local = T.alloc_fragment((block, block), fp8_dtype)
+            if transpose:
+                shared = T.alloc_shared((block, block), fp8_dtype)
+                transposed = T.alloc_fragment((block, block), fp8_dtype)
+                T.annotate_layout({shared: make_swizzled_layout(shared)})
             for i, j in T.Parallel(block, block):
                 r, c = br * block + i, bc * block + j
                 value = T.if_then_else(r < rows and c < cols, T.cast(x[r, c], "float32"), 0.0)
@@ -73,43 +77,48 @@ def _quantize_kernel(rows, cols, dtype, fp8_dtype, rowwise, transpose):
             if rowwise:
                 T.copy(local, q[br * block, bc * block])
             if transpose:
+                # Redistribute lanes through shared memory so both layouts use
+                # contiguous global stores instead of byte-wise scatter writes.
+                T.copy(local, shared)
                 for i, j in T.Parallel(block, block):
-                    if br * block + i < rows and bc * block + j < cols:
-                        qt[bc * block + j, br * block + i] = local[i, j]
+                    transposed[i, j] = shared[j, i]
+                T.copy(transposed, qt[bc * block, br * block])
     return kernel
 
 
 @tilelang.jit
 def _transpose_kernel(rows, cols, dtype):
-    block = 32
+    block = 64
 
     @T.prim_func
     def kernel(x: T.Tensor((rows, cols), dtype), out: T.Tensor((cols, rows), dtype)):
         with T.Kernel(T.ceildiv(cols, block), T.ceildiv(rows, block), threads=128) as (bc, br):
             shared = T.alloc_shared((block, block), dtype)
+            result = T.alloc_fragment((block, block), dtype)
+            T.annotate_layout({shared: make_swizzled_layout(shared)})
             T.copy(x[br * block, bc * block], shared)
             for i, j in T.Parallel(block, block):
-                if br * block + i < rows and bc * block + j < cols:
-                    out[bc * block + j, br * block + i] = shared[i, j]
+                result[i, j] = shared[j, i]
+            T.copy(result, out[bc * block, br * block])
     return kernel
 
 
 @tilelang.jit
-def _gemm_kernel(m, n, k, a_dtype, b_dtype, out_dtype, bias_dtype, has_bias):
-    bm, bn, bk = 64, 64, 64
+def _gemm_kernel(m, n, k, a_dtype, b_dtype, out_dtype, bias_dtype, has_bias,
+                 bm=64, bn=64, bk=64, threads=128, stages=3):
 
     @T.prim_func
     def kernel(a: T.Tensor((m, k), a_dtype), b: T.Tensor((n, k), b_dtype),
                sa: T.Tensor((1,), "float32"), sb: T.Tensor((1,), "float32"),
                bias: T.Tensor((n,) if has_bias else (0,), bias_dtype),
                out: T.Tensor((m, n), out_dtype)):
-        with T.Kernel(T.ceildiv(n, bn), T.ceildiv(m, bm), threads=128) as (bx, by):
+        with T.Kernel(T.ceildiv(n, bn), T.ceildiv(m, bm), threads=threads) as (bx, by):
             a_shared = T.alloc_shared((bm, bk), a_dtype)
             b_shared = T.alloc_shared((bn, bk), b_dtype)
             acc = T.alloc_fragment((bm, bn), "float32")
             result = T.alloc_fragment((bm, bn), out_dtype)
             T.clear(acc)
-            for i in T.Pipelined(T.ceildiv(k, bk), num_stages=3):
+            for i in T.Pipelined(T.ceildiv(k, bk), num_stages=stages):
                 T.copy(a[by * bm, i * bk], a_shared)
                 T.copy(b[bx * bn, i * bk], b_shared)
                 T.gemm(a_shared, b_shared, acc, transpose_B=True)
@@ -123,43 +132,50 @@ def _gemm_kernel(m, n, k, a_dtype, b_dtype, out_dtype, bias_dtype, has_bias):
 
 
 @tilelang.jit
-def _mixed_gemm_kernel(m, n, k, a_dtype, b_dtype, out_dtype, bias_dtype, has_bias):
+def _mixed_gemm_kernel(m, n, k, a_dtype, b_dtype, out_dtype, bias_dtype, has_bias,
+                       bm=64, bn=64, bk=64, threads=128, stages=3):
     """Emit mixed E4M3/E5M2 MMA directly; T.gemm's MMA path requires equal dtypes."""
-    bm, bn, bk = 64, 64, 64
+    row_warps, col_warps = (2, 2) if threads == 128 else (4, 2)
     mma = TensorCoreIntrinEmitter(a_dtype=a_dtype, b_dtype=b_dtype, accum_dtype="float32",
                                   a_transposed=False, b_transposed=True,
-                                  block_row_warps=2, block_col_warps=2,
-                                  warp_row_tiles=32, warp_col_tiles=32, chunk=bk)
+                                  block_row_warps=row_warps, block_col_warps=col_warps,
+                                  warp_row_tiles=bm // row_warps, warp_col_tiles=bn // col_warps, chunk=bk)
+    store_map = mma.get_store_index_map()
 
     @T.prim_func
     def kernel(a: T.Tensor((m, k), a_dtype), b: T.Tensor((n, k), b_dtype),
                sa: T.Tensor((1,), "float32"), sb: T.Tensor((1,), "float32"),
                bias: T.Tensor((n,) if has_bias else (0,), bias_dtype),
                out: T.Tensor((m, n), out_dtype)):
-        with T.Kernel(T.ceildiv(n, bn), T.ceildiv(m, bm), threads=128) as (bx, by):
+        with T.Kernel(T.ceildiv(n, bn), T.ceildiv(m, bm), threads=threads) as (bx, by):
             a_shared = T.alloc_shared((bm, bk), a_dtype)
             b_shared = T.alloc_shared((bn, bk), b_dtype)
-            result = T.alloc_shared((bm, bn), "float32")
-            a_local = T.alloc_local((32,), a_dtype)
-            b_local = T.alloc_local((32,), b_dtype)
-            acc = T.alloc_local((32,), "float32")
+            a_local = T.alloc_local((mma.warp_rows * mma.local_size_a,), a_dtype)
+            b_local = T.alloc_local((mma.warp_cols * mma.local_size_b,), b_dtype)
+            acc = T.alloc_local((bm * bn // threads,), "float32")
             T.annotate_layout({a_shared: make_swizzled_layout(a_shared),
                                b_shared: make_swizzled_layout(b_shared)})
             T.clear(acc)
-            for ko in T.Pipelined(T.ceildiv(k, bk), num_stages=3):
+            for ko in T.Pipelined(T.ceildiv(k, bk), num_stages=stages):
                 T.copy(a[by * bm, ko * bk], a_shared)
                 T.copy(b[bx * bn, ko * bk], b_shared)
                 for ki in T.serial(bk // 32):
                     mma.ldmatrix_a(a_local, a_shared, ki)
                     mma.ldmatrix_b(b_local, b_shared, ki)
                     mma.mma(a_local, b_local, acc)
-            mma.stmatrix(acc, result)
-            for i, j in T.Parallel(bm, bn):
-                if by * bm + i < m and bx * bn + j < n:
-                    value = result[i, j] * sa[0] * sb[0]
-                    if has_bias:
-                        value += T.cast(bias[bx * bn + j], "float32")
-                    out[by * bm + i, bx * bn + j] = value
+            # Keep the epilogue in registers. Avoid a full FP32 shared-memory
+            # output tile and its barrier, leaving more space for pipelining.
+            lane, warp_n, warp_m = T.meta_var(mma.extract_thread_binding(T.get_thread_binding()))
+            for i, j in T.grid(mma.warp_rows, mma.warp_cols):
+                for local_id in T.unroll(mma.local_size_out):
+                    r, c = T.meta_var(store_map.map_indices([lane, local_id]))
+                    row = by * bm + warp_m * (bm // row_warps) + i * mma.micro_size_x + r
+                    col = bx * bn + warp_n * (bn // col_warps) + j * mma.micro_size_y + c
+                    if row < m and col < n:
+                        value = acc[i * mma.warp_cols * mma.local_size_out + j * mma.local_size_out + local_id] * sa[0] * sb[0]
+                        if has_bias:
+                            value += T.cast(bias[col], "float32")
+                        out[row, col] = value
     return kernel
 
 
@@ -190,13 +206,18 @@ def transpose(x, out=None):
     return out
 
 
-def gemm(a, b, sa, sb, *, out_dtype, bias=None):
+def gemm(a, b, sa, sb, *, out_dtype, bias=None, autotune=False):
     """Compute (a * sa) @ (b * sb).T, including scaling/bias in the epilogue."""
     m, k = a.shape
     n = b.shape[0]
     out = torch.empty((m, n), device=a.device, dtype=out_dtype)
     empty_bias = bias if bias is not None else torch.empty(0, device=a.device, dtype=out_dtype)
     kernel = _gemm_kernel if a.dtype == b.dtype else _mixed_gemm_kernel
-    kernel(m, n, k, _dtype(a), _dtype(b), _dtype(out), _dtype(empty_bias), bias is not None)(
+    config = {}
+    if autotune:
+        from ._linear_tuning import get_config
+        config = get_config(m, n, k, _dtype(a), _dtype(b), _dtype(out), _dtype(empty_bias),
+                            bias is not None, a.device.index)
+    kernel(m, n, k, _dtype(a), _dtype(b), _dtype(out), _dtype(empty_bias), bias is not None, **config)(
         a, b, sa, sb, empty_bias, out)
     return out

@@ -37,7 +37,8 @@ class _Linear(torch.autograd.Function):
         sx = layer.input_quantizer.scale(x, layer.fp8_dtype)
         save_fp8 = need_backward and weight.requires_grad and layer.saved_input_dtype == "fp8"
         qx, qxt = kernels.quantize(x, sx, transpose=save_fp8, fp8_dtype=layer.fp8_dtype)
-        y = kernels.gemm(qx, weight, sx, layer.weight_scale, out_dtype=x.dtype, bias=bias)
+        y = kernels.gemm(qx, weight, sx, layer.weight_scale, out_dtype=x.dtype, bias=bias,
+                         autotune=layer.autotune)
 
         if need_backward:
             if save_fp8:
@@ -71,20 +72,21 @@ class _Linear(torch.autograd.Function):
         dx = dw = db = None
         if needs_x:
             wt = cached_wt if cached_wt.numel() else kernels.transpose(weight)
-            dx = kernels.gemm(qg, wt, sg, sw, out_dtype=ctx.x_dtype).reshape(ctx.shape)
+            dx = kernels.gemm(qg, wt, sg, sw, out_dtype=ctx.x_dtype, autotune=layer.autotune).reshape(ctx.shape)
             del wt
         if needs_w:
             if not qgt.numel():
-                if qg.numel():
-                    qgt = kernels.transpose(qg)
-                else:
-                    _, qgt = kernels.quantize(dy, sg, rowwise=False, transpose=True, fp8_dtype=layer.backward_fp8_dtype)
-            del qg
+                # Requantize from the existing dY with the same scale after
+                # releasing its row layout, avoiding two live FP8 dY copies.
+                del qg
+                _, qgt = kernels.quantize(dy, sg, rowwise=False, transpose=True, fp8_dtype=layer.backward_fp8_dtype)
+            else:
+                del qg
             if ctx.save_fp8:
                 xt = saved_x
             else:
                 _, xt = kernels.quantize(saved_x, sx, rowwise=False, transpose=True, fp8_dtype=layer.fp8_dtype)
-            dw = kernels.gemm(qgt, xt, sg, sx, out_dtype=ctx.weight_grad_dtype)
+            dw = kernels.gemm(qgt, xt, sg, sx, out_dtype=ctx.weight_grad_dtype, autotune=layer.autotune)
         if needs_b:
             db = dy.sum(dim=0, dtype=ctx.bias_grad_dtype)
         # These are derivatives w.r.t. real weights; the optimizer updates their
@@ -104,7 +106,7 @@ class Linear(nn.Module):
     def __init__(self, in_features, out_features, bias=True, *, mode="memory",
                  forward_dtype="e4m3", backward_dtype="e5m2",
                  cache_weight_transpose=None, saved_input_dtype="fp8",
-                 scaling="current", history_len=16, device=None, dtype=None):
+                 scaling="current", history_len=16, autotune=False, device=None, dtype=None):
         super().__init__()
         assert mode in ("memory", "speed")
         formats = {"e4m3": torch.float8_e4m3fn, "e5m2": torch.float8_e5m2}
@@ -114,6 +116,7 @@ class Linear(nn.Module):
         assert scaling in ("current", "delayed") and history_len > 0
         self.in_features, self.out_features = in_features, out_features
         self.mode, self.saved_input_dtype = mode, saved_input_dtype
+        self.autotune = autotune
         self.cache_weight_transpose = mode == "speed" if cache_weight_transpose is None else cache_weight_transpose
         config = settings()
         master_dtype = config["master_weight_dtype"] or torch.float32
@@ -233,4 +236,4 @@ class Linear(nn.Module):
                 f"bias={self.bias is not None}, mode={self.mode!r}, "
                 f"forward_dtype={self.forward_dtype!r}, backward_dtype={self.backward_dtype!r}, "
                 f"cache_weight_transpose={self.cache_weight_transpose}, "
-                f"saved_input_dtype={self.saved_input_dtype!r}")
+                f"saved_input_dtype={self.saved_input_dtype!r}, autotune={self.autotune}")
