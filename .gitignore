@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+results/
+checkpoints/
+.cache/
+build/
+dist/
+.env
+.env.*
+data/
+datasets/
+outputs/
+*.pt
+*.pth
+*.safetensors
