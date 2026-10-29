@@ -175,7 +175,7 @@ def save(report, output):
     output.write_text(json.dumps(report, indent=2) + "\n")
     rows = []
     for row in report["results"]:
-        flat = {key: (value["median_ms"] if isinstance(value, dict) else value)
+        flat = {key: (value["median_ms"] if isinstance(value, dict) and "median_ms" in value else value)
                 for key, value in row.items()}
         rows.append(flat)
     if rows:

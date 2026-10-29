@@ -102,7 +102,7 @@ layer = viola.nn.Linear(
 ```
 
 前向 `X @ W.T` 与反向 `dY @ W`、`dY.T @ X` 使用真正的 FP8 Tensor Core GEMM，
-FP32 内部累加。默认前向权重、输入为 E4M3，反向 dY 为 E5M2，直接执行混合
+默认使用 FP32 内部累加。默认前向权重、输入为 E4M3，反向 dY 为 E5M2，直接执行混合
 E5M2 × E4M3 乘法，复用前向保存的权重和输入。`backward_dtype` 不控制最终参数梯度的存储。
 量化、转置、GEMM 都由 TileLang 实现，scale 与 bias 在 GEMM 尾部融合。
 
@@ -115,6 +115,21 @@ E5M2 × E4M3 乘法，复用前向保存的权重和输入。`backward_dtype` �
 `scaling="current"/"delayed"`、`history_len=16`。默认 per-tensor current scaling。
 W 与 W.T 共享一个 FP32 scale。已有层用 `viola.nn.Linear.from_float(nn_linear, ...)` 转换。
 
+也可以在 FP16 中计算每段局部和，再汇总到 FP32：
+
+```python
+layer = viola.nn.Linear(
+    4096, 16384, device="cuda", dtype=torch.bfloat16,
+    accum_dtype="fp16", accum_block_size=512,
+    accum_reduce_dtype="fp32", autotune=True,
+)
+```
+
+这里的 `512` 是沿矩阵乘法的 K 维每 512 项汇总一次，forward、dX、dW 都应用这一策略；
+dW 的 K 维对应展开后的 token 数。局部和与分块总和保留在寄存器中，量化 scale 根据
+分块长度为 FP16 累加预留数值范围。`accum_reduce_dtype` 可选 `fp32` 或 `bf16`。
+最终梯度的存储精度仍由 `viola.set_gradient_dtype()` 独立设置。
+
 用 `autotune=True` 为实际矩阵形状搜索 GEMM 配置：
 
 ```python
@@ -123,8 +138,12 @@ layer = viola.nn.Linear(4096, 16384, mode="memory", autotune=True,
 ```
 
 前向、dX、dW 根据各自的矩阵形状和 FP8 类型分别搜索分块、线程数、流水线深度，
-候选配置与 FP32 参考计算核对后才参与选择。配置按 GPU 型号、形状、类型、工具链和
-kernel 源码缓存到 `~/.cache/viola/linear/`，后续运行直接加载。累加精度仍为 FP32。
+搜索会根据当前 GPU 的共享内存容量和矩阵形状筛选分块，再测量 warp 布局、块的遍历
+顺序和数据搬运方式，并对最终候选进行正反顺序复测。分块模式同时计入局部和、总和的
+寄存器占用，前向还比较原生 GEMM 与显式 MMA 布局。候选配置通过数值核对后才参与选择。
+配置按 GPU 型号、计算能力、形状、类型、累加方式、工具链和源码缓存到
+`~/.cache/viola/linear/`，后续运行直接加载。
+默认使用 FP32 累加；autotune 本身不改变计算精度。
 默认不开启搜索；首次使用新形状时会编译并计时，使用 CUDA Graph 前先完成普通前后向预热。
 
 训练前可单独预调优 4 倍扩展 MLP 所需的全部 GEMM：
@@ -135,6 +154,9 @@ TILELANG_AUTO_TUNING_CPU_COUNTS=4 PYTHONPATH=. python checks/autotune_linear.py 
 
 PYTHONPATH=. python checks/benchmark_mlp.py --tokens 16384 --autotune
 ```
+
+两条命令都可追加 `--accum-dtype fp16 --accum-block-size 512 --accum-reduce-dtype fp32`
+来调优和测量分块版本。
 
 ## 精度策略与主权重
 

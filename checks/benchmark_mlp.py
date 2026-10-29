@@ -14,7 +14,8 @@ import viola
 from benchmark_linear import measure, save
 
 
-def run_case(tokens, width, expansion, mode, iterations, autotune=False):
+def run_case(tokens, width, expansion, mode, iterations, autotune=False, linear_options=None,
+              check_finite=True):
     gc.collect()
     torch.cuda.empty_cache()
     torch.manual_seed(20261029)
@@ -23,7 +24,8 @@ def run_case(tokens, width, expansion, mode, iterations, autotune=False):
                           nn.Linear(expansion * width, width, bias=False, device="cuda", dtype=torch.bfloat16))
     if mode != "bf16":
         for index in (0, 2):
-            model[index] = viola.nn.Linear.from_float(model[index], mode=mode, autotune=autotune)
+            model[index] = viola.nn.Linear.from_float(model[index], mode=mode, autotune=autotune,
+                                                      **(linear_options or {}))
     optimizer = viola.optim.bind_optimizer(model, torch.optim.SGD(model.parameters(), lr=.001, foreach=False))
     torch.manual_seed(123)
     x = torch.randn(tokens, width, device="cuda", dtype=torch.bfloat16, requires_grad=True)
@@ -55,8 +57,10 @@ def run_case(tokens, width, expansion, mode, iterations, autotune=False):
     for _ in range(3):
         training()
     torch.cuda.synchronize()
-    assert all(p.grad.dtype == torch.bfloat16 and bool(p.grad.isfinite().all()) for p in model.parameters())
-    assert bool(x.grad.isfinite().all())
+    assert all(p.grad.dtype == torch.bfloat16 for p in model.parameters())
+    if check_finite:
+        assert all(bool(p.grad.isfinite().all()) for p in model.parameters())
+        assert bool(x.grad.isfinite().all())
     clear()
     tensors = [x, dy, *model.parameters(), *model.buffers(),
                *(p for group in optimizer.param_groups for p in group["params"])]
@@ -69,6 +73,8 @@ def run_case(tokens, width, expansion, mode, iterations, autotune=False):
     peak = persistent + torch.cuda.max_memory_allocated() - allocated_before
     clear()
     row = dict(tokens=tokens, width=width, expansion=expansion, mode=mode,
+               linear_options=linear_options or {},
+               finite_check=check_finite,
                parameters=sum(p.numel() for p in model.parameters()),
                input_mib=x.nbytes / 2**20,
                model_weight_mib=sum(p.nbytes for p in model.parameters()) / 2**20,
@@ -95,6 +101,10 @@ def main():
     parser.add_argument("--expansion", type=int, default=4)
     parser.add_argument("--iterations", type=int, default=5)
     parser.add_argument("--autotune", action="store_true")
+    parser.add_argument("--modes", default="bf16,memory,speed")
+    parser.add_argument("--accum-dtype", choices=("fp32", "fp16"), default="fp32")
+    parser.add_argument("--accum-block-size", type=int, default=0)
+    parser.add_argument("--accum-reduce-dtype", choices=("fp32", "bf16"), default="fp32")
     parser.add_argument("--output", default="results/mlp-performance.json")
     args = parser.parse_args()
     torch.set_num_threads(4)
@@ -109,11 +119,13 @@ def main():
                   memory_scope="full MLP with retained root X/dY, master+grads+activations+temporaries; no optimizer state",
                   results=[])
     begin = time.perf_counter()
-    modes = ["bf16", "memory", "speed"]
+    modes = args.modes.split(",")
+    linear_options = dict(accum_dtype=args.accum_dtype, accum_block_size=args.accum_block_size,
+                          accum_reduce_dtype=args.accum_reduce_dtype)
     for index, tokens in enumerate(map(int, args.tokens.split(","))):
-        for mode in modes[index % 3:] + modes[:index % 3]:
+        for mode in modes[index % len(modes):] + modes[:index % len(modes)]:
             print(f"start tokens={tokens} width={args.width} expansion={args.expansion} {mode}", flush=True)
-            row = run_case(tokens, args.width, args.expansion, mode, args.iterations, args.autotune)
+            row = run_case(tokens, args.width, args.expansion, mode, args.iterations, args.autotune, linear_options)
             report["results"].append(row)
             report["elapsed_s"] = time.perf_counter() - begin
             save(report, Path(args.output))

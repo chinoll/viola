@@ -16,9 +16,10 @@ class _Quantizer(nn.Module):
         self.index = 0
         self.register_buffer("history", torch.zeros(history_len, device=device, dtype=torch.float32))
 
-    def scale(self, x, fp8_dtype=torch.float8_e4m3fn):
+    def scale(self, x, fp8_dtype=torch.float8_e4m3fn, quantization_limit=None):
         scale = kernels.tensor_scale(x, history=self.history, index=self.index,
-                                     delayed=self.scaling == "delayed", fp8_dtype=fp8_dtype)
+                                     delayed=self.scaling == "delayed", fp8_dtype=fp8_dtype,
+                                     quantization_limit=quantization_limit)
         self.index += 1
         return scale
 
@@ -34,11 +35,14 @@ class _Linear(torch.autograd.Function):
     def forward(ctx, x, weight, bias, layer, need_backward):
         shape = x.shape
         x = x.reshape(-1, layer.in_features).contiguous()
-        sx = layer.input_quantizer.scale(x, layer.fp8_dtype)
+        input_limit = layer._quantization_limit(max(x.shape), layer.fp8_dtype)
+        sx = layer.input_quantizer.scale(x, layer.fp8_dtype, input_limit)
         save_fp8 = need_backward and weight.requires_grad and layer.saved_input_dtype == "fp8"
-        qx, qxt = kernels.quantize(x, sx, transpose=save_fp8, fp8_dtype=layer.fp8_dtype)
+        qx, qxt = kernels.quantize(x, sx, transpose=save_fp8, fp8_dtype=layer.fp8_dtype,
+                                  quantization_limit=input_limit)
         y = kernels.gemm(qx, weight, sx, layer.weight_scale, out_dtype=x.dtype, bias=bias,
-                         autotune=layer.autotune)
+                         autotune=layer.autotune, accum_dtype=layer.accum_dtype,
+                         accum_block_size=layer.accum_block_size, accum_reduce_dtype=layer.accum_reduce_dtype)
 
         if need_backward:
             if save_fp8:
@@ -53,6 +57,7 @@ class _Linear(torch.autograd.Function):
                                   layer.weight_transpose)
             ctx.layer, ctx.shape, ctx.x_dtype = layer, shape, x.dtype
             ctx.save_fp8 = save_fp8
+            ctx.input_limit = input_limit
             ctx.weight_grad_dtype = weight.grad_dtype
             ctx.bias_grad_dtype = bias.grad_dtype if bias is not None else None
         return y.reshape(*shape[:-1], layer.out_features)
@@ -63,30 +68,37 @@ class _Linear(torch.autograd.Function):
         layer = ctx.layer
         dy = dy.reshape(-1, layer.out_features).contiguous()
         needs_x, needs_w, needs_b = ctx.needs_input_grad[:3]
-        sg = layer.grad_quantizer.scale(dy, layer.backward_fp8_dtype)
+        grad_limit = layer._quantization_limit(max(dy.shape), layer.backward_fp8_dtype)
+        sg = layer.grad_quantizer.scale(dy, layer.backward_fp8_dtype, grad_limit)
         # memory: do dX first, release W.T, then materialize dY.T for dW.
         # speed: quantize both dY layouts together and reuse the persistent W.T.
         qg, qgt = kernels.quantize(dy, sg, rowwise=needs_x,
                                   transpose=needs_w and (layer.mode == "speed" or not needs_x),
-                                  fp8_dtype=layer.backward_fp8_dtype)
+                                  fp8_dtype=layer.backward_fp8_dtype, quantization_limit=grad_limit)
         dx = dw = db = None
         if needs_x:
             wt = cached_wt if cached_wt.numel() else kernels.transpose(weight)
-            dx = kernels.gemm(qg, wt, sg, sw, out_dtype=ctx.x_dtype, autotune=layer.autotune).reshape(ctx.shape)
+            dx = kernels.gemm(qg, wt, sg, sw, out_dtype=ctx.x_dtype, autotune=layer.autotune,
+                              accum_dtype=layer.accum_dtype, accum_block_size=layer.accum_block_size,
+                              accum_reduce_dtype=layer.accum_reduce_dtype).reshape(ctx.shape)
             del wt
         if needs_w:
             if not qgt.numel():
                 # Requantize from the existing dY with the same scale after
                 # releasing its row layout, avoiding two live FP8 dY copies.
                 del qg
-                _, qgt = kernels.quantize(dy, sg, rowwise=False, transpose=True, fp8_dtype=layer.backward_fp8_dtype)
+                _, qgt = kernels.quantize(dy, sg, rowwise=False, transpose=True, fp8_dtype=layer.backward_fp8_dtype,
+                                          quantization_limit=grad_limit)
             else:
                 del qg
             if ctx.save_fp8:
                 xt = saved_x
             else:
-                _, xt = kernels.quantize(saved_x, sx, rowwise=False, transpose=True, fp8_dtype=layer.fp8_dtype)
-            dw = kernels.gemm(qgt, xt, sg, sx, out_dtype=ctx.weight_grad_dtype, autotune=layer.autotune)
+                _, xt = kernels.quantize(saved_x, sx, rowwise=False, transpose=True, fp8_dtype=layer.fp8_dtype,
+                                         quantization_limit=ctx.input_limit)
+            dw = kernels.gemm(qgt, xt, sg, sx, out_dtype=ctx.weight_grad_dtype, autotune=layer.autotune,
+                              accum_dtype=layer.accum_dtype, accum_block_size=layer.accum_block_size,
+                              accum_reduce_dtype=layer.accum_reduce_dtype)
         if needs_b:
             db = dy.sum(dim=0, dtype=ctx.bias_grad_dtype)
         # These are derivatives w.r.t. real weights; the optimizer updates their
@@ -106,7 +118,9 @@ class Linear(nn.Module):
     def __init__(self, in_features, out_features, bias=True, *, mode="memory",
                  forward_dtype="e4m3", backward_dtype="e5m2",
                  cache_weight_transpose=None, saved_input_dtype="fp8",
-                 scaling="current", history_len=16, autotune=False, device=None, dtype=None):
+                 scaling="current", history_len=16, autotune=False, accum_dtype="fp32",
+                 accum_block_size=0, accum_reduce_dtype="fp32", quantization_limit=None,
+                 device=None, dtype=None):
         super().__init__()
         assert mode in ("memory", "speed")
         formats = {"e4m3": torch.float8_e4m3fn, "e5m2": torch.float8_e5m2}
@@ -117,6 +131,13 @@ class Linear(nn.Module):
         self.in_features, self.out_features = in_features, out_features
         self.mode, self.saved_input_dtype = mode, saved_input_dtype
         self.autotune = autotune
+        assert accum_dtype in ("fp32", "fp16")
+        assert accum_reduce_dtype in ("fp32", "bf16")
+        assert accum_block_size >= 0 and accum_block_size % 32 == 0
+        self.accum_dtype = accum_dtype
+        self.accum_block_size = accum_block_size
+        self.accum_reduce_dtype = accum_reduce_dtype
+        self.quantization_limit = quantization_limit
         self.cache_weight_transpose = mode == "speed" if cache_weight_transpose is None else cache_weight_transpose
         config = settings()
         master_dtype = config["master_weight_dtype"] or torch.float32
@@ -138,6 +159,18 @@ class Linear(nn.Module):
         self.grad_quantizer = _Quantizer(scaling, history_len, device)
         self.reset_parameters()
 
+    def _quantization_limit(self, reduction, fp8_dtype):
+        if self.quantization_limit is not None:
+            return min(self.quantization_limit, torch.finfo(fp8_dtype).max)
+        if self.accum_dtype == "fp32":
+            return None
+        # FP8 codes are accumulated before their scales are restored. Reserve
+        # FP16 range for the reduction, not just for each individual operand.
+        if self.accum_block_size:
+            reduction = self.accum_block_size
+        limit = 2.0 ** math.floor(math.log2(math.sqrt(32768.0 / reduction)))
+        return min(limit, torch.finfo(fp8_dtype).max)
+
     @torch.no_grad()
     def reset_parameters(self):
         master = self._master_ref() if self._master_ref is not None else self._initial_weight
@@ -149,17 +182,19 @@ class Linear(nn.Module):
     @torch.no_grad()
     def refresh_weight(self, master):
         """Called after an optimizer update, directly from its updated master."""
+        weight_limit = self._quantization_limit(max(self.in_features, self.out_features), self.fp8_dtype)
         if self.cache_weight_transpose and self.weight_transpose.numel() == 0:
             self.weight_transpose = torch.empty((self.in_features, self.out_features), device=master.device,
                                                 dtype=self.fp8_dtype)
         if master.is_cuda:
-            scale = self.weight_quantizer.scale(master, self.fp8_dtype)
+            scale = self.weight_quantizer.scale(master, self.fp8_dtype, weight_limit)
             self.weight_scale.copy_(scale)
             kernels.quantize(master, scale, transpose=self.cache_weight_transpose,
-                             fp8_dtype=self.fp8_dtype, out=self.weight, out_t=self.weight_transpose)
+                             fp8_dtype=self.fp8_dtype, out=self.weight, out_t=self.weight_transpose,
+                             quantization_limit=weight_limit)
         else:
             # CPU construction only; CUDA training always uses the TileLang kernels.
-            fp8_max = torch.finfo(self.fp8_dtype).max
+            fp8_max = torch.finfo(self.fp8_dtype).max if weight_limit is None else weight_limit
             amax = master.float().abs().max()
             quantizer = self.weight_quantizer
             maximum = quantizer.history.max() if quantizer.scaling == "delayed" and quantizer.index else amax
@@ -236,4 +271,6 @@ class Linear(nn.Module):
                 f"bias={self.bias is not None}, mode={self.mode!r}, "
                 f"forward_dtype={self.forward_dtype!r}, backward_dtype={self.backward_dtype!r}, "
                 f"cache_weight_transpose={self.cache_weight_transpose}, "
-                f"saved_input_dtype={self.saved_input_dtype!r}, autotune={self.autotune}")
+                f"saved_input_dtype={self.saved_input_dtype!r}, autotune={self.autotune}, "
+                f"accum_dtype={self.accum_dtype!r}, accum_block_size={self.accum_block_size}, "
+                f"accum_reduce_dtype={self.accum_reduce_dtype!r}")
