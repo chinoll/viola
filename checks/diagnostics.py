@@ -5,7 +5,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "experiments"))
 from audit import FIELDS, advance_shadow, comparison, measure
-from viola.kernels import dequantize, momentum_update, state_sizes
+from viola.optim._kernels import dequantize, momentum_update, state_sizes
 
 
 @torch.no_grad()

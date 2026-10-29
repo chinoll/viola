@@ -4,10 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "viola-fp8-muon"
-version = "0.1.0"
-description = "Explicit FP8 Muon plugin for DeepSpeed ZeRO-1 and ZeRO-2"
+version = "0.2.0"
+description = "TileLang FP8 neural network modules and standalone PyTorch optimizers"
 requires-python = ">=3.10"
-dependencies = ["torch>=2.11", "deepspeed==0.19.7", "tilelang==0.1.15"]
+dependencies = ["torch>=2.11", "tilelang==0.1.15"]
+
+[project.optional-dependencies]
+experiments = ["numpy", "pyarrow", "datasets", "huggingface_hub"]
 
 [tool.setuptools.packages.find]
 include = ["viola*"]

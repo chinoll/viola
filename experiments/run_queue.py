@@ -10,7 +10,7 @@ import time
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA = Path('/data/datasets/imagenet-256-sd-vae-ft-mse-latents')
-OUT = Path('/data/experiments/viola-fp8-muon/dit-b-patch32-20261029')
+OUT = Path('/data/experiments/viola-fp8-muon/dit-b-patch32-standalone')
 OUT.mkdir(parents=True, exist_ok=True)
 
 
@@ -37,7 +37,7 @@ def main():
     if args.adopt_pid:
         previous = json.loads((OUT / 'status.json').read_text())
         status('training', run=args.adopt_run, gpus=[3], epochs=10, token_budget=16384,
-               adopted_pid=args.adopt_pid, next_run='zero2-dp1-tokens16384-bf16',
+               adopted_pid=args.adopt_pid, next_run='ddp1-tokens16384-bf16',
                training_started_at=previous.get('training_started_at', previous['updated_at']))
         while not (OUT / args.adopt_run / 'complete.json').exists():
             if not Path(f'/proc/{args.adopt_pid}').exists():
@@ -59,7 +59,7 @@ def main():
     jobs += [(world, batch, 'fp8') for world in (1, 2) for batch in (256, 128, 64)
              if (world, batch) != (1, 256)]
     for world, batch, momentum_dtype in jobs:
-        name = f'zero2-dp{world}-tokens{batch * 64}-' + ('bf16' if momentum_dtype == 'bf16' else 'balanced')
+        name = f'ddp{world}-tokens{batch * 64}-' + ('bf16' if momentum_dtype == 'bf16' else 'balanced')
         output = OUT / name
         if (output / 'complete.json').exists():
             continue
@@ -85,7 +85,7 @@ def main():
             status('comparing_fp8_bf16', steps=50040)
             with (OUT / 'comparison.log').open('w') as log:
                 subprocess.run([sys.executable, str(ROOT / 'experiments/compare_runs.py'),
-                    '--fp8', str(OUT / 'zero2-dp1-tokens16384-balanced'), '--bf16', str(output),
+                    '--fp8', str(OUT / 'ddp1-tokens16384-balanced'), '--bf16', str(output),
                     '--output', str(OUT / 'fp8-vs-bf16')], cwd=ROOT, env=env,
                     stdout=log, stderr=subprocess.STDOUT, check=True)
     status('complete')

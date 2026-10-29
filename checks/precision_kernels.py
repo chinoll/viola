@@ -2,7 +2,7 @@
 import itertools
 import json
 import torch
-from viola.kernels import adam_update, weight_update
+from viola.optim._kernels import adam_update, weight_update
 
 
 def assert_storage_rounding(actual, value):

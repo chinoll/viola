@@ -24,7 +24,7 @@ def main():
     args = p.parse_args()
     torch.set_num_threads(4)
     left, right = read_json(args.fp8 / "settings.json"), read_json(args.bf16 / "settings.json")
-    matched = ("seed", "batch", "micro_batch", "world_size", "epochs", "lr", "stage", "model", "dataset")
+    matched = ("seed", "batch", "micro_batch", "world_size", "epochs", "lr", "model", "dataset")
     for key in matched:
         assert left[key] == right[key], f"Training settings differ: {key}"
     assert left["source_sha256"]["experiments/dit.py"] == right["source_sha256"]["experiments/dit.py"]
@@ -42,18 +42,16 @@ def main():
                 loss_difference=a[step]["loss"] - b[step]["loss"],
                 fp8_probe=a[step].get("fixed_probe_loss", ""), bf16_probe=b[step].get("fixed_probe_loss", "")))
 
-    from deepspeed.utils.zero_to_fp32 import get_fp32_state_dict_from_zero_checkpoint
-    weights = [get_fp32_state_dict_from_zero_checkpoint(str(r / "checkpoint"), tag="state", lazy_mode=True)
-               for r in (args.fp8, args.bf16)]
-    model_file = next((args.bf16 / "checkpoint/state").glob('*model_states.pt'))
-    model_state = torch.load(model_file, map_location="cpu", weights_only=False)
-    names = [name for group in model_state["param_shapes"] for name in group]
-    del model_state
+    checkpoints = [torch.load(root / "checkpoint.pt", map_location="cpu", weights_only=True, mmap=True)
+                   for root in (args.fp8, args.bf16)]
+    weights = [dict(zip(c["master_names"], c["optimizer"]["viola_masters"]["weights"])) for c in checkpoints]
+    names = checkpoints[0]["master_names"]
+    assert names == checkpoints[1]["master_names"]
     totals = dict(error_squared_sum=0., reference_squared_sum=0., actual_squared_sum=0.,
                   dot=0., absolute_sum=0., max_abs=0., elements=0)
     rows = []
     for name in names:
-        # DeepSpeed reconstructs the FP32 masters, avoiding BF16 model-save rounding.
+        # Compare the actual saved masters, independently of model storage dtype.
         x, y = [state[name].contiguous().double() for state in weights]
         delta = x - y
         es, rs, xs = delta.square().sum().item(), y.square().sum().item(), x.square().sum().item()

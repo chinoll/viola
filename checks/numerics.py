@@ -4,7 +4,7 @@ import json
 import torch
 import torch.nn.functional as F
 
-from viola.kernels import copy_scaled, momentum_update, weight_update
+from viola.optim._kernels import copy_scaled, momentum_update, weight_update
 
 
 def unpack(q, scales, tile_size, n):
@@ -54,7 +54,7 @@ def main():
                     beta=0.95, tile_size=tile_size)
     assert torch.count_nonzero(next_q) == 0 and torch.count_nonzero(out) == 0
 
-    # ZeRO views may have valid element alignment but no 16-byte alignment.
+    # Tensor views may have valid element alignment but no 16-byte alignment.
     n, tile_size = 1537, 256
     blocks = (n + tile_size - 1) // tile_size
     grad = torch.randn(n + 1, device="cuda", dtype=torch.bfloat16)[1:]

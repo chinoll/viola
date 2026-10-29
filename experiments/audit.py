@@ -5,7 +5,7 @@ import numpy as np
 import torch
 import pyarrow as pa
 import pyarrow.parquet as pq
-from viola.kernels import dequantize
+from viola.optim._kernels import dequantize
 
 
 PAIRS = ("fp8_bf16",)

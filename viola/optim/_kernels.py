@@ -83,7 +83,7 @@ def dequantize(q, scales, shape, *, granularity="tile", tile_size=256, block_sha
     return (q.view(torch.float8_e4m3fn).float().view(-1, rows, cols) * expanded).flatten()
 
 
-# ZeRO gradients and scale slices can begin at arbitrary element offsets.
+# Gradient views and scale slices can begin at arbitrary element offsets.
 # Scalar global accesses remain coalesced without requiring an aligned clone.
 @tilelang.jit(pass_configs={tilelang.PassConfigKey.TIR_DISABLE_VECTORIZE: True})
 def _momentum_1d_kernel(n, tile_size, grad_dtype, nesterov, rounding):
@@ -222,7 +222,7 @@ def _copy_scaled_kernel(n, size, dtype, out_dtype):
     return kernel
 
 
-# ZeRO partitions and mixed element widths do not guarantee vector-load alignment.
+# Tensor views and mixed element widths do not guarantee vector-load alignment.
 # Scalar accesses across adjacent lanes remain coalesced, without padding copies.
 @tilelang.jit(pass_configs={tilelang.PassConfigKey.TIR_DISABLE_VECTORIZE: True})
 def _weight_kernel(n, grad_dtype, weight_dtype, rounding):
@@ -234,6 +234,7 @@ def _weight_kernel(n, grad_dtype, weight_dtype, rounding):
         grad: T.Tensor((n,), grad_dtype),
         lr: T.float32,
         decay: T.float32,
+        update_scale: T.float32,
         rounding_step: T.int64,
         rounding_key: T.int64,
         offset: T.int64,
@@ -243,7 +244,7 @@ def _weight_kernel(n, grad_dtype, weight_dtype, rounding):
             for i in T.Parallel(tile):
                 j = pid * tile + i
                 if j < n:
-                    value = T.cast(weight[j], "float32") * (1.0 - lr * decay) - lr * T.cast(grad[j], "float32")
+                    value = T.cast(weight[j], "float32") * (1.0 - lr * decay) - lr * update_scale * T.cast(grad[j], "float32")
                     if rounding == "stochastic" and weight_dtype != "float32":
                         weight[j] = T.call_extern("float32",
                             "viola_stochastic_bf16" if weight_dtype == "bfloat16" else "viola_stochastic_fp16",
@@ -321,9 +322,9 @@ def copy_scaled(update, partition, src, dst, count, scale):
     )
 
 
-def weight_update(weight, grad, lr, weight_decay, *, rounding="nearest", step=0, key=0, offset=0):
+def weight_update(weight, grad, lr, weight_decay, *, update_scale=1.0, rounding="nearest", step=0, key=0, offset=0):
     _weight_kernel(weight.numel(), _dtype(grad), _dtype(weight), rounding)(
-        weight.view(-1), grad.view(-1), float(lr), float(weight_decay), int(step), int(key), int(offset),
+        weight.view(-1), grad.reshape(-1), float(lr), float(weight_decay), float(update_scale), int(step), int(key), int(offset),
     )
 
 

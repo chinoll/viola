@@ -7,7 +7,7 @@ import torch.nn.functional as F
 import tilelang
 import tilelang.language as T
 
-from viola.kernels import _ROUNDING_SOURCE, dequantize, momentum_update, state_sizes
+from viola.optim._kernels import _ROUNDING_SOURCE, dequantize, momentum_update, state_sizes
 
 
 @tilelang.jit
@@ -87,7 +87,7 @@ def main():
         for shape in ((17, 31), (2, 33, 67)):
             qn, sn = state_sizes(shape, **quant)
             for rounding in ("nearest", "stochastic"):
-                # Offset every buffer: ZeRO slices need not be 16-byte aligned.
+                # Offset every buffer: Tensor slices need not be 16-byte aligned.
                 q = torch.zeros(qn + 1, dtype=torch.uint8, device="cuda")[1:]
                 scale = torch.ones(sn + 1, device="cuda")[1:]
                 n = math.prod(shape)

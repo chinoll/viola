@@ -1,4 +1,2 @@
 torch>=2.11
-deepspeed==0.19.7
 tilelang==0.1.15
-accelerate>=1.0
