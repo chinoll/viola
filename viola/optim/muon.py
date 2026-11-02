@@ -2,6 +2,7 @@
 
 import os
 import warnings
+from functools import partial
 
 import torch
 
@@ -32,7 +33,8 @@ class FP8Muon(torch.optim.Optimizer):
     def __init__(self, params, lr=1e-3, *, weight_decay=0., momentum=.95,
                  nesterov=True, mode="balanced", granularity="tile", tile_size=None,
                  block_shape=None, rounding="nearest", rounding_seed=0,
-                 ns_steps=None, ns_method="standard", adjust_lr_fn="match_rms_adamw",
+                 ns_steps=None, ns_method="standard", ns_backend="torch", ns_autotune=True,
+                 adjust_lr_fn="match_rms_adamw",
                  betas=(.9, .95), eps=1e-8, adam_state_dtype="fp32", skip_nonfinite=False):
         tile_default, steps_default = _MODES[mode]
         policy = settings()
@@ -42,6 +44,7 @@ class FP8Muon(torch.optim.Optimizer):
             block_shape=(16, 16) if block_shape is None else tuple(block_shape),
             rounding=rounding, rounding_seed=rounding_seed,
             ns_steps=steps_default if ns_steps is None else ns_steps, ns_method=ns_method,
+            ns_backend=ns_backend, ns_autotune=ns_autotune,
             adjust_lr_fn=adjust_lr_fn, betas=betas, eps=eps, adam_state_dtype=_dtype(adam_state_dtype),
             master_rounding=policy["master_rounding"], master_rounding_seed=policy["master_rounding_seed"])
         self.skip_nonfinite = skip_nonfinite
@@ -58,6 +61,7 @@ class FP8Muon(torch.optim.Optimizer):
         assert group["lr"] >= 0 and group["weight_decay"] >= 0
         assert 0 <= group["momentum"] < 1 and group["ns_steps"] > 0
         assert group["ns_method"] in METHODS
+        assert group["ns_backend"] in ("torch", "tilelang")
         assert group["adjust_lr_fn"] in ("original", "match_rms_adamw")
         assert group["granularity"] in ("tile", "block")
         assert group["rounding"] in ("nearest", "stochastic")
@@ -132,6 +136,9 @@ class FP8Muon(torch.optim.Optimizer):
                 if _use_muon(param, group):
                     matrix = self._momentum(param, grad, state, group, key)
                     ns = METHODS[group["ns_method"]]
+                    if group.get("ns_backend", "torch") == "tilelang":
+                        from ._orthogonalize_kernels import orthogonalize
+                        ns = partial(orthogonalize, method=group["ns_method"], autotune=group["ns_autotune"])
                     update = ns(matrix, steps=group["ns_steps"])
                     if self.observer is not None:
                         self.observer.update(param, update, group, ns)

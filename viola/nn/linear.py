@@ -52,9 +52,14 @@ class _Linear(torch.autograd.Function):
                               quantization_limit=weight_limit)
         else:
             qw, sw, wt = weight, layer.weight_scale, layer.weight_transpose
-        y = kernels.gemm(qx, qw, sx, sw, out_dtype=x.dtype, bias=bias,
-                         autotune=layer.autotune, accum_dtype=layer.accum_dtype,
-                         accum_block_size=layer.accum_block_size, accum_reduce_dtype=layer.accum_reduce_dtype)
+        if getattr(ctx, 'gated_forward', None):
+            from ._mlp_kernels import gemm
+            y, ctx.gate_aux, ctx.gate_encoded = gemm(qx, qw, sx, sw, layer=layer, out_dtype=x.dtype,
+                                  bias=bias, activation=ctx.gated_forward, save=need_backward)
+        else:
+            y = kernels.gemm(qx, qw, sx, sw, out_dtype=x.dtype, bias=bias,
+                             autotune=layer.autotune, accum_dtype=layer.accum_dtype,
+                             accum_block_size=layer.accum_block_size, accum_reduce_dtype=layer.accum_reduce_dtype)
         del qw
 
         if need_backward:
@@ -72,7 +77,7 @@ class _Linear(torch.autograd.Function):
             ctx.input_limit = input_limit
             ctx.weight_grad_dtype = weight.grad_dtype
             ctx.bias_grad_dtype = bias.grad_dtype if bias is not None else None
-        return y.reshape(*shape[:-1], layer.out_features)
+        return y.reshape(*shape[:-1], y.shape[-1])
 
     @staticmethod
     def backward(ctx, dy):
@@ -98,12 +103,23 @@ class _Linear(torch.autograd.Function):
                                   quantization_limit=layer._quantization_limit(max(weight.shape), layer.fp8_dtype))
             else:
                 wt = kernels.transpose(weight)
-            dx = kernels.gemm(qg, wt, sg, sw, out_dtype=ctx.x_dtype, autotune=layer.autotune,
-                              accum_dtype=layer.accum_dtype, accum_block_size=layer.accum_block_size,
-                              accum_reduce_dtype=layer.accum_reduce_dtype)
-            if layer.rotation_size:
-                rotation.inverse_(dx)
-            dx = dx.reshape(ctx.shape)
+            if getattr(ctx, 'gated_backward', None) and not layer.rotation_size:
+                from ._mlp_kernels import gemm
+                dx, _, _ = gemm(qg, wt, sg, sw, layer=layer, out_dtype=ctx.x_dtype,
+                             activation=ctx.gated_backward, backward=True, aux=ctx.gate_aux)
+            else:
+                dx = kernels.gemm(qg, wt, sg, sw, out_dtype=ctx.x_dtype, autotune=layer.autotune,
+                                  accum_dtype=layer.accum_dtype, accum_block_size=layer.accum_block_size,
+                                  accum_reduce_dtype=layer.accum_reduce_dtype)
+                if layer.rotation_size:
+                    rotation.inverse_(dx)
+                if getattr(ctx, 'gated_backward', None):
+                    # The inverse rotation must precede the nonlinear derivative.
+                    from ._gated_kernels import backward_kernel
+                    dz = dx.new_empty((dx.shape[0], 2 * dx.shape[1]))
+                    backward_kernel(dx.shape[1], kernels._dtype(dx), ctx.gated_backward)(ctx.gate_aux, dx, dz)
+                    dx = dz
+            dx = dx.reshape(*ctx.shape[:-1], dx.shape[-1])
             del wt
         if needs_w:
             if not qgt.numel():

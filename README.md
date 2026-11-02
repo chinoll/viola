@@ -12,7 +12,7 @@ viola.optim.bind_optimizer(model, optimizer)
 
 | 模块 | 职责 |
 | --- | --- |
-| `viola.nn` | 网络算子，目前提供 FP8 `Linear` |
+| `viola.nn` | FP8 `Linear` 与融合门控 `MLP` |
 | `viola.optim` | 独立的 `FP8Muon` 优化器与 `bind_optimizer` 主权重绑定 |
 | `viola.precision` | 主权重、参数梯度的独立精度策略 |
 
@@ -89,6 +89,12 @@ TileLang 在寄存器内以 FP32 恢复和更新动量，产生本步 BF16 正�
 
 默认 `skip_nonfinite=False`，不额外扫描梯度、不自动跳步，Inf/NaN 正常传播。
 显式设置 `True` 才检查并跳过整个更新；它仅检查当前进程收到的梯度。
+
+TileLang 正交化可通过 `ns_backend="tilelang"` 启用；`ns_autotune=True` 在第一次
+`optimizer.step()` 使用真实动量矩阵，为 Gram、多项式和更新 GEMM 分别搜索分块、
+流水线和数据搬运配置。静态矩阵尺寸参与编译优化，选出的配置按 GPU、矩阵形状、
+精度及 epilogue 缓存；同形状参数共享结果。首次搜索比窄预算版本耗时更长。
+这条路径仍在优化，默认保留原来的 `torch.compile` 正交化。
 
 ## FP8 Linear
 
@@ -231,6 +237,47 @@ PYTHONPATH=. python checks/benchmark_mlp.py --tokens 16384 --autotune
 
 两条命令都可追加 `--accum-dtype fp16 --accum-block-size 512 --accum-reduce-dtype fp32`
 来调优和测量分块版本。
+
+## 融合门控 MLP
+
+```python
+mlp = viola.nn.MLP(
+    in_features=4096,
+    hidden_features=16384,
+    activation="silu",          # silu / gelu（tanh 近似）/ relu
+    weight_dtype="bf16", scaling="mxfp8",
+    forward_dtype="e4m3", backward_dtype="e5m2",
+    mode="memory", autotune=True,
+    device="cuda", dtype=torch.bfloat16,
+)
+y = mlp(x)
+```
+
+计算为 `down(activation(gate(x)) * up(x))`，默认输出宽度等于输入宽度，也可指定
+`out_features`。`hidden_features` 是每条门控分支的扩展宽度。
+所有 Linear 的权重存储、FP8 格式、scale、累加精度和缓存选项均可传入。
+
+前向 TileLang kernel 同时计算 gate/up 两个 GEMM，共享输入 tile，并在寄存器里
+完成激活与相乘。使用 MXFP8、`input_group_shape=(1, 32)` 与
+`saved_input_dtype="fp8"` 时，同一 kernel 从 shared memory 直接产生供 down 使用的
+FP8 激活及供其反向使用的转置，不向显存写入完整的 BF16/FP16 隐藏激活。
+两个方向分别计算 scale，保持与独立量化相同的规则。
+反向将 down 投影的 dX GEMM 与门控求导融合，直接输出两个分支的
+梯度，不写回中间 dH。down 前向与参数梯度 GEMM 仍各自运行；整个 MLP 并非单次
+CUDA kernel。启用旋转时，反向先恢复坐标，再计算门控导数。
+
+首次输入确定 token 数，融合 kernel 按 GPU、输入宽度、扩展宽度、激活及精度配置
+搜索 tile 并缓存到 `~/.cache/viola/mlp/`；其余 GEMM 使用 Linear 的 autotune。
+训练照常通过 `viola.optim.bind_optimizer(mlp, optimizer)` 绑定主权重。
+
+```bash
+PYTHONPATH=. python checks/benchmark_fused_mlp.py \
+  --tokens 2048,4096,16384 --dim 4096 --hidden 16384 \
+  --scaling mxfp8 --storage bf16 --output results/fused-mlp.json
+```
+
+token 数是 batch 与序列长度展平后的总数。测试包含 BF16、未融合 FP8 与融合 FP8，
+分别记录预热后的前向、前向加反向耗时及峰值显存；首次 autotune 不计入稳态耗时。
 
 ## 精度策略与主权重
 

@@ -4,6 +4,7 @@ from functools import lru_cache
 import hashlib
 import json
 import os
+import warnings
 from pathlib import Path
 from statistics import median
 
@@ -48,24 +49,38 @@ def _remeasure(kernel, candidates, inputs, expected, half):
     """Compare finalists in both orders after compilation, at steady clocks."""
     configs = list({json.dumps(c, sort_keys=True): c for c in candidates}.values())
     output = torch.empty_like(expected)
-    graphs, compiled_kernels = [], []
+    graphs, compiled_kernels, validated = [], [], []
     for config in configs:
         options = dict(config)
         copy_mode = options.pop("copy_mode")
         compiled = tilelang.compile(kernel(**options), target="cuda", pass_configs=COPY_PASSES[copy_mode])
-        compiled_kernels.append(compiled)
         output.fill_(float("nan"))
         compiled(*inputs, output)
-        if half:
-            assert bool(output.isfinite().all()), "Non-finite GEMM output"
-            assert ((output.float() - expected.float()).norm() / expected.float().norm()).item() <= .05
-        else:
-            torch.testing.assert_close(output, expected, rtol=.01, atol=.01)
+        try:
+            if half:
+                assert bool(output.isfinite().all()), "Non-finite GEMM output"
+                assert ((output.float() - expected.float()).norm() / expected.float().norm()).item() <= .05
+            else:
+                torch.testing.assert_close(output, expected, rtol=.01, atol=.01)
+            previous = output.clone()
+            for _ in range(2):
+                compiled(*inputs, output)
+                assert torch.equal(output, previous), "Nondeterministic GEMM candidate"
+            del previous
+        except AssertionError as error:
+            # A tuner rejects an invalid schedule; inference never catches or
+            # suppresses arithmetic failures. Keep the same strict tolerance.
+            warnings.warn(f"Rejecting autotune candidate {config}: {str(error).splitlines()[0]}", RuntimeWarning)
+            continue
+        compiled_kernels.append(compiled)
+        validated.append(config)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             for _ in range(8):
                 compiled(*inputs, output)
         graphs.append(graph)
+    assert graphs, "No numerically valid GEMM autotune candidate."
+    configs = validated
     samples = [[] for _ in graphs]
     indices = list(range(len(graphs)))
     for index in indices + indices[::-1]:
@@ -158,6 +173,8 @@ def get_config(m, n, k, a_dtype, b_dtype, out_dtype, bias_dtype, has_bias, devic
             rows = (1, 2, 4, 8) if explicit else (0,)
             for row in rows:
                 if explicit and (row > best_config["threads"] // 32 or best_config["bm"] // row < 16):
+                    continue
+                if explicit and best_config["bn"] // (best_config["threads"] // 32 // row) < 8:
                     continue
                 for panel, order in ((0, "row"), (4, "row"), (8, "row"), (16, "row"),
                                       (4, "column"), (8, "column"), (16, "column")):

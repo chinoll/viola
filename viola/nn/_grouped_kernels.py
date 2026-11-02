@@ -171,20 +171,7 @@ def transpose(q, scale, group, *, native=False, limit=None):
                     source_scale=scale, source_group=group)
 
 
-@tilelang.jit
-def gemm_kernel(m, n, k, a_dtype, b_dtype, out_dtype, bias_dtype, has_bias,
-                ar, ak, br, bk_scale, native, accum_dtype='float32', partial_k=32,
-                reduce_dtype='float32', bm=64, bn=64, bk=64, threads=128, stages=2,
-                cache_scales=True):
-    row_warps = 2 if threads == 128 else 4
-    col_warps = threads // 32 // row_warps
-    mma = TensorCoreIntrinEmitter(a_dtype=a_dtype, b_dtype=b_dtype, accum_dtype=accum_dtype,
-        a_transposed=False, b_transposed=True, block_row_warps=row_warps,
-        block_col_warps=col_warps, warp_row_tiles=bm // row_warps,
-        warp_col_tiles=bn // col_warps, chunk=bk)
-    store = mma.get_store_index_map()
-    sf_dtype = 'uint8' if native else 'float32'
-    sa_shape, sb_shape = scale_shape((m, k), (ar, ak)), scale_shape((n, k), (br, bk_scale))
+def native_mma_source(a_dtype, b_dtype):
     ad, bd = ({'float8_e4m3': 'e4m3', 'float8_e5m2': 'e5m2'}[d] for d in (a_dtype, b_dtype))
     fn = f'viola_grouped_mx_{ad}_{bd}'
     source = '''
@@ -201,6 +188,25 @@ __device__ __forceinline__ void FN(const void *ap, const void *bp, float *c,
           "r"(sa), "h"(selector), "h"(selector), "r"(sb), "h"(selector), "h"(selector));
 }
 '''.replace('FN', fn).replace('AD', ad).replace('BD', bd)
+
+    return fn, source
+
+
+@tilelang.jit
+def gemm_kernel(m, n, k, a_dtype, b_dtype, out_dtype, bias_dtype, has_bias,
+                ar, ak, br, bk_scale, native, accum_dtype='float32', partial_k=32,
+                reduce_dtype='float32', bm=64, bn=64, bk=64, threads=128, stages=2,
+                cache_scales=True):
+    row_warps = 2 if threads == 128 else 4
+    col_warps = threads // 32 // row_warps
+    mma = TensorCoreIntrinEmitter(a_dtype=a_dtype, b_dtype=b_dtype, accum_dtype=accum_dtype,
+        a_transposed=False, b_transposed=True, block_row_warps=row_warps,
+        block_col_warps=col_warps, warp_row_tiles=bm // row_warps,
+        warp_col_tiles=bn // col_warps, chunk=bk)
+    store = mma.get_store_index_map()
+    sf_dtype = 'uint8' if native else 'float32'
+    sa_shape, sb_shape = scale_shape((m, k), (ar, ak)), scale_shape((n, k), (br, bk_scale))
+    fn, source = native_mma_source(a_dtype, b_dtype)
 
     @T.prim_func
     def kernel(a: T.Tensor((m, k), a_dtype), b: T.Tensor((n, k), b_dtype),
