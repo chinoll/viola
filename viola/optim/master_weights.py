@@ -37,7 +37,7 @@ class _MasterWeights:
                         if initial is None:
                             # Model-only checkpoint; full training resumes overwrite
                             # this with the original master from optimizer.state_dict.
-                            initial = layer.weight.float() * layer.weight_scale
+                            initial = layer.dequantize_weight()
                         master = nn.Parameter(initial.to(self.master_dtype), requires_grad=param.requires_grad)
                         layer._initial_weight = None
                         layer._master_ref = weakref.ref(master)

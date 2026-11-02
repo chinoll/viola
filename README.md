@@ -115,6 +115,52 @@ E5M2 × E4M3 乘法，复用前向保存的权重和输入。`backward_dtype` �
 `scaling="current"/"delayed"`、`history_len=16`。默认 per-tensor current scaling。
 W 与 W.T 共享一个 FP32 scale。已有层用 `viola.nn.Linear.from_float(nn_linear, ...)` 转换。
 
+需要局部缩放时，可使用普通 FP8 MMA 配合 FP32 scale，或 RTX Blackwell 的原生 MXFP8：
+
+```python
+layer = viola.nn.Linear(
+    4096, 16384,
+    scaling="grouped",                 # grouped / mxfp8
+    weight_group_shape=(32, 32),        # W 的二维分块
+    input_group_shape=(1, 32),          # X 沿 GEMM K 维的一维分组
+    grad_group_shape=(1, 32),           # dY 的分组
+    autotune=True,
+    device="cuda", dtype=torch.bfloat16,
+)
+```
+
+三项分组形状可分别设置。`(1, 64)` 表示每行连续 64 个元素共享 scale；`(64, 64)`
+表示一个二维区域共享 scale。边长为 2 的幂，第二维至少为 32；尾部不足一组正常处理。
+分组大小描述量化共享范围，独立于 GEMM 的计算 tile。前向和反向均使用 TileLang kernel。
+
+| `scaling` | scale | 计算方式 |
+| --- | --- | --- |
+| `current` / `delayed` | 整张量一个 FP32 scale | GEMM 尾部恢复尺度 |
+| `grouped` | 每组一个自由 FP32 scale | 普通 FP8 MMA，局部和恢复尺度后合并 |
+| `mxfp8` | 每组一个 UE8M0 scale，值为 2 的幂 | SM120/SM121 原生 block-scaled MMA，FP32 累加 |
+
+两种分组模式均使用当前分组的 amax，不使用 LS 修正或历史统计。MXFP8 以 32 个 K
+维元素为硬件缩放单元；更大的分组和二维分块通过复用对应的 scale 实现。该后端要求
+FP32 累加，不与 `rotation_size` 组合；`grouped` 支持 FP16 局部累加和既有范围限制。
+
+X.T 和 dY.T 直接从浮点输入独立量化，FP8 输入保存模式只保留 dW 所需的 X.T。
+W 的二维分块两边均至少为 32 时，转置仅调整 FP8 数据和 scale 的布局；一维 W
+或行分组小于 32 时，需要在转置方向重新分组量化。默认的二维权重分块可避免这次额外量化。
+`memory` 在 dX 时生成 W.T 并释放，`speed` 缓存 W.T 和对应 scale。恢复 checkpoint 时
+使用相同的 scaling、分组形状和 FP8 格式。
+
+分组后端的 `autotune=True` 搜索计算 tile、K 分块、线程数、流水级数、scale 的 shared
+memory 缓存和异步搬运配置。候选先验证数值和重复执行的一致性，再计时；结果按 GPU、形状、精度、分组、
+累加配置和 kernel 版本缓存在 `~/.cache/viola/grouped/`。再次遇到同一配置直接使用缓存。
+
+可选 `rotation_size=64` 在每 64 个输入通道内做固定 Regular Hadamard 变换，再量化为
+FP8；默认 `0` 保持原路径。它要求输入通道数是 64 的倍数，适合对离群值敏感的层做消融。
+主权重仍在原坐标系中，优化后才生成旋转 FP8 权重。反向复用旋转后的 FP8 张量，并将
+dX/dW 原地逆旋转回原坐标；不额外保留完整的浮点旋转副本。此选项不改变 FP8 格式、
+per-tensor scale 或累加策略，也不保证所有分布的误差都会降低。
+`layer.dequantize_weight()` 返回原坐标下的解量化权重。恢复 checkpoint 时使用相同的
+`rotation_size` 配置。
+
 也可以在 FP16 中计算每段局部和，再汇总到 FP32：
 
 ```python
