@@ -101,7 +101,7 @@ def main():
     parser.add_argument("--expansion", type=int, default=4)
     parser.add_argument("--iterations", type=int, default=5)
     parser.add_argument("--autotune", action="store_true")
-    parser.add_argument("--modes", default="bf16,memory,speed")
+    parser.add_argument("--modes", default="bf16,memory,fast")
     parser.add_argument("--accum-dtype", choices=("fp32", "fp16"), default="fp32")
     parser.add_argument("--accum-block-size", type=int, default=0)
     parser.add_argument("--accum-reduce-dtype", choices=("fp32", "bf16"), default="fp32")

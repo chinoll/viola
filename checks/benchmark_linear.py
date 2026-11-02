@@ -189,7 +189,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--tokens", default="64,256,1024,4096,16384")
     parser.add_argument("--dimensions", default="768:768,768:3072,3072:768,2048:2048,2048:8192,8192:2048")
-    parser.add_argument("--modes", default="bf16,memory,speed")
+    parser.add_argument("--modes", default="bf16,memory,fast")
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--iterations", type=int, default=20)
     parser.add_argument("--autotune", action="store_true")

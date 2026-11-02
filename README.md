@@ -95,7 +95,7 @@ TileLang 在寄存器内以 FP32 恢复和更新动量，产生本步 BF16 正�
 ```python
 layer = viola.nn.Linear(
     1024, 4096, device="cuda", dtype=torch.bfloat16,
-    mode="memory",           # memory / speed
+    mode="memory",           # memory / fast
     forward_dtype="e4m3",    # e4m3 / e5m2
     backward_dtype="e5m2",   # e4m3 / e5m2，独立选择
 )
@@ -109,7 +109,7 @@ E5M2 × E4M3 乘法，复用前向保存的权重和输入。`backward_dtype` �
 | 预设 | 常驻模型权重 | backward 保存的输入 | 权重转置 |
 | --- | --- | --- | --- |
 | `memory` | FP8 W | FP8 X.T | dX 时生成，随后释放 |
-| `speed` | FP8 W + W.T | FP8 X.T | 跨 microbatch 复用，优化后刷新 |
+| `fast` | FP8 W + W.T | FP8 X.T | 跨 microbatch 复用，优化后刷新 |
 
 可独立覆盖 `cache_weight_transpose=True/False`、`saved_input_dtype="fp8"/"bf16"/"fp16"/"fp32"`、
 `scaling="current"/"delayed"`、`history_len=16`。默认 per-tensor current scaling。
@@ -146,7 +146,7 @@ FP32 累加，不与 `rotation_size` 组合；`grouped` 支持 FP16 局部累加
 X.T 和 dY.T 直接从浮点输入独立量化，FP8 输入保存模式只保留 dW 所需的 X.T。
 W 的二维分块两边均至少为 32 时，转置仅调整 FP8 数据和 scale 的布局；一维 W
 或行分组小于 32 时，需要在转置方向重新分组量化。默认的二维权重分块可避免这次额外量化。
-`memory` 在 dX 时生成 W.T 并释放，`speed` 缓存 W.T 和对应 scale。恢复 checkpoint 时
+`memory` 在 dX 时生成 W.T 并释放，`fast` 缓存 W.T 和对应 scale。恢复 checkpoint 时
 使用相同的 scaling、分组形状和 FP8 格式。
 
 分组后端的 `autotune=True` 搜索计算 tile、K 分块、线程数、流水级数、scale 的 shared

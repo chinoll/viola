@@ -7,7 +7,7 @@ import viola
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=("memory", "speed"), default="memory")
+    parser.add_argument("--mode", choices=("memory", "fast"), default="memory")
     parser.add_argument("--forward-dtype", choices=("e4m3", "e5m2"), default="e4m3")
     parser.add_argument("--backward-dtype", choices=("e4m3", "e5m2"), default="e5m2")
     args = parser.parse_args()
@@ -27,7 +27,7 @@ def main():
             loss = (model(inputs).float() - targets.float()).square().mean()
             (loss / 4).backward()
             losses.append(loss.detach())
-        # Updates the master, then requantizes W (and W.T in speed mode).
+        # Updates the master, then requantizes W (and W.T in fast mode).
         optimizer.step()
         if step % 10 == 0:
             print(f"step={step + 1} loss={torch.stack(losses).mean().item():.5f}")

@@ -75,9 +75,9 @@ class _Linear(torch.autograd.Function):
         grad_limit = layer._quantization_limit(max(dy.shape), layer.backward_fp8_dtype)
         sg = layer.grad_quantizer.scale(dy, layer.backward_fp8_dtype, grad_limit)
         # memory: do dX first, release W.T, then materialize dY.T for dW.
-        # speed: quantize both dY layouts together and reuse the persistent W.T.
+        # fast: quantize both dY layouts together and reuse the persistent W.T.
         qg, qgt = kernels.quantize(dy, sg, rowwise=needs_x,
-                                  transpose=needs_w and (layer.mode == "speed" or not needs_x),
+                                  transpose=needs_w and (layer.mode == "fast" or not needs_x),
                                   fp8_dtype=layer.backward_fp8_dtype, quantization_limit=grad_limit)
         dx = dw = db = None
         if needs_x:
@@ -135,7 +135,7 @@ class Linear(nn.Module):
                  weight_group_shape=(32, 32), input_group_shape=(1, 32), grad_group_shape=(1, 32),
                  device=None, dtype=None):
         super().__init__()
-        assert mode in ("memory", "speed")
+        assert mode in ("memory", "fast")
         formats = {"e4m3": torch.float8_e4m3fn, "e5m2": torch.float8_e5m2}
         self.forward_dtype, self.backward_dtype = forward_dtype, backward_dtype
         self.fp8_dtype, self.backward_fp8_dtype = formats[forward_dtype], formats[backward_dtype]
@@ -166,7 +166,7 @@ class Linear(nn.Module):
         assert rotation_size in (0, 64)
         assert not rotation_size or in_features % rotation_size == 0
         self.rotation_size = rotation_size
-        self.cache_weight_transpose = mode == "speed" if cache_weight_transpose is None else cache_weight_transpose
+        self.cache_weight_transpose = mode == "fast" if cache_weight_transpose is None else cache_weight_transpose
         config = settings()
         master_dtype = config["master_weight_dtype"] or torch.float32
         gradient_dtype = config["gradient_dtype"] or torch.float32

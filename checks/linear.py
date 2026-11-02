@@ -96,7 +96,7 @@ def presets_and_storage():
     x = torch.randn(128, 512, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     outputs, grads = [], []
     rows = []
-    for mode in ("memory", "speed"):
+    for mode in ("memory", "fast"):
         layer = viola.nn.Linear.from_float(source, mode=mode)
         opt = viola.optim.bind_optimizer(layer, torch.optim.AdamW(layer.parameters(), lr=.001))
         saved = []
@@ -177,16 +177,16 @@ def main():
     report = {"gpu": torch.cuda.get_device_name(), "torch": torch.__version__}
     report["numerics"] = [numerical(fmt, backward, mode, (37, 80, 48) if mode == "memory" else (128, 256, 192), grad)
                            for fmt in ("e4m3", "e5m2") for backward in ("e4m3", "e5m2")
-                           for mode, grad in (("memory", "fp32"), ("speed", "bf16"))]
+                           for mode, grad in (("memory", "fp32"), ("fast", "bf16"))]
     print("numerics passed", flush=True)
     report["update_resume"] = [update_and_resume(fmt, mode, scaling, grad)
                                 for fmt in ("e4m3", "e5m2") for mode, scaling, grad in
-                                (("memory", "current", "bf16"), ("speed", "delayed", "fp32"))]
-    report["update_resume"].append(update_and_resume("e4m3", "speed", "current", "fp32", "bf16"))
+                                (("memory", "current", "bf16"), ("fast", "delayed", "fp32"))]
+    report["update_resume"].append(update_and_resume("e4m3", "fast", "current", "fp32", "bf16"))
     report["storage"] = presets_and_storage()
     print("update, checkpoint and storage checks passed", flush=True)
     report["training"] = [training(fmt) for fmt in (None, "e4m3", "e5m2")]
-    report["peak_memory"] = [peak_memory(mode) for mode in ("bf16", "memory", "speed")]
+    report["peak_memory"] = [peak_memory(mode) for mode in ("bf16", "memory", "fast")]
     report["ptx"] = {}
     for fmt in ("e4m3", "e5m2"):
         kernel = _gemm_kernel(128, 192, 256, "float8_" + fmt, "float8_" + fmt, "bfloat16", "bfloat16", True)

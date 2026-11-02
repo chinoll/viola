@@ -128,8 +128,8 @@ def main():
     save('kernels',check_kernel(False,(1,32),(32,32),(e5,e4),(65,96,128),True))
     for scaling in ('grouped','mxfp8'):
         save('layers', check_layer(scaling,'memory',(32,32),(1,32),(1,32)))
-        save('layers', check_layer(scaling,'speed',(32,64),(32,32),(1,64),saved='bf16'))
-        save('layers', check_layer(scaling,'speed',(1,32),(1,32),(1,32)))
+        save('layers', check_layer(scaling,'fast',(32,64),(32,32),(1,64),saved='bf16'))
+        save('layers', check_layer(scaling,'fast',(1,32),(1,32),(1,32)))
     save('layers',check_layer('grouped','memory',(32,32),(1,32),(1,32),half=True))
     report.update(complete=True, seconds=time.monotonic()-started)
     args.output.write_text(json.dumps(report, indent=2) + '\n')
