@@ -15,6 +15,7 @@ viola.optim.bind_optimizer(model, optimizer)
 | `viola.nn` | FP8 `Linear` 与融合门控 `MLP` |
 | `viola.optim` | 独立的 `FP8Muon` 优化器与 `bind_optimizer` 主权重绑定 |
 | `viola.precision` | 主权重、参数梯度的独立精度策略 |
+| `viola.distributed` | DTensor 通信、完整矩阵归属与分片 EMA |
 
 使用普通 PyTorch `backward()` / `optimizer.step()`。不依赖或兼容 DeepSpeed，
 没有全局优化器替换、ZeRO 钩子或旧插件入口。
@@ -48,8 +49,8 @@ optimizer = viola.optim.FP8Muon([
 ```
 
 卷积权重展开为 `[Cout, Cin * Kh * Kw]` 进行正交化。专家矩阵参数组设置 `batched=True`，
-则保持最后两维为矩阵，对每个专家分别计算。参数梯度由训练框架完成累积和规约，
-优化器每次 `step()` 才更新一次动量，不自行发起分布式通信。
+则保持最后两维为矩阵，对每个专家分别计算。普通 Tensor 路径由训练框架完成梯度累积和
+规约；DTensor 路径由优化器按梯度布局收集／归约到 owner。每次 `step()` 更新一次动量。
 
 | 预设 | 默认 tile_size | 默认 NS 步数 |
 | --- | ---: | ---: |
@@ -88,13 +89,71 @@ TileLang 在寄存器内以 FP32 恢复和更新动量，产生本步 BF16 正�
 不消耗模型训练的随机数流。
 
 默认 `skip_nonfinite=False`，不额外扫描梯度、不自动跳步，Inf/NaN 正常传播。
-显式设置 `True` 才检查并跳过整个更新；它仅检查当前进程收到的梯度。
+显式设置 `True` 才检查并跳过整个更新；普通 Tensor 检查本进程梯度，DTensor 则在所属
+mesh 内同步跳步决定，避免部分 rank 跳过后其他 rank 等待通信。
 
 TileLang 正交化可通过 `ns_backend="tilelang"` 启用；`ns_autotune=True` 在第一次
 `optimizer.step()` 使用真实动量矩阵，为 Gram、多项式和更新 GEMM 分别搜索分块、
 流水线和数据搬运配置。静态矩阵尺寸参与编译优化，选出的配置按 GPU、矩阵形状、
 精度及 epilogue 缓存；同形状参数共享结果。首次搜索比窄预算版本耗时更长。
 这条路径仍在优化，默认保留原来的 `torch.compile` 正交化。
+
+## DTensor 底座
+
+`FP8Muon` 现在接受一维 `DeviceMesh` 上的 DTensor 参数：`Replicate()`、`Shard(dim)`
+均可，梯度还可以是 `Partial("sum")` 或 `Partial("avg")`。示例：
+
+```python
+from torch.distributed.tensor import distribute_tensor, Replicate
+from viola.distributed import ShardedEMA
+
+# 进程组、mesh 已创建；每个 rank 都按相同顺序构建参数与优化器。
+weight = torch.nn.Parameter(distribute_tensor(initial_weight, mesh, [Replicate()]))
+optimizer = viola.optim.FP8Muon([weight], lr=1e-3)
+ema = ShardedEMA([("weight", weight)], optimizer, decay=0.9999)
+```
+
+参数的 DTensor placement 描述存储布局；`optimizer.partition` 另外按完整参数的元素
+数量分配 owner。每次更新将完整梯度及必要的权重收集到 owner，由它运行原有 TileLang
+动量 kernel、完整矩阵正交化和权重更新，再广播／散发回原来的 placement。仅 owner
+保存该参数的 FP8 动量和辅助 AdamW 状态；其他 rank 不重复运行正交化。不均匀分片、
+末尾空分片、卷积展开和 `batched=True` 专家参数均保留全局形状语义。
+更新按每个 owner 一份参数组成一轮，各卡可同时运行本地正交化，每轮结束同步权重。
+
+普通 Tensor 路径保持原来的单进程更新。DTensor 的 `Shard`／`Replicate` 梯度视为
+已归约的逻辑梯度，不再次除以卡数；`Partial` 按它声明的 sum／avg 归约。手动提供
+各卡局部平均 loss 的梯度时，可以使用：
+
+```python
+from viola.distributed import partial_gradient
+
+weight.grad = partial_gradient(local_gradient, mesh, average=True)
+optimizer.step()
+```
+
+这里的平均假设各卡样本／有效 token 数相同。数量不同时应按全局分母加权贡献，再设
+`average=False` 求和。不能把各卡不同的局部梯度标成 `Replicate()`。所有 rank 必须以
+相同参数顺序参与 step，并对哪些参数有梯度保持一致。
+
+EMA 绑定 optimizer 的 post-step hook，用户不用写更新循环。`decay=0` 不创建状态、
+不注册 hook，`state_dict()` 返回空字典。开启时，已分片参数沿用其布局，复制参数的 EMA
+从本卡权重取 dim-0 切片，因此更新不增加通信；标量保留复制布局。绑定主权重后，EMA
+读取主权重。`ema.state_dict()` 包含分片 DTensor、decay 和更新计数。
+
+优化器 checkpoint 需各 rank 保存自己的一份，并在相同 rank、mesh、参数顺序和布局
+下恢复；包含 owner 元数据和本卡拥有的状态。尚未实现改变卡数后的优化器状态重分配。
+收集完整矩阵、NS 工作区和通信打包会占用临时显存，常驻动量分片并不意味着峰值显存
+也严格按卡数下降。
+
+端到端示例使用原生 PyTorch Linear 和 DTensor autograd，计算权重每卡驻留，优化器
+状态分配到 owner：
+
+```bash
+PYTHONPATH=. torchrun --standalone --nproc-per-node=2 examples/train_dtensor.py --ema-decay 0.9999
+```
+
+当前交付的是布局、通信、优化器和 EMA 底座；尚未接入 `violaEngine` 的
+`viola1`／`viola2` 调度、FSDP2，或 Viola FP8 Linear/MLP 的 DTensor 算子边界。
 
 ## FP8 Linear
 
@@ -298,6 +357,10 @@ viola.optim.bind_optimizer(model, optimizer)
 `fp32` / `bf16` / `fp16`，不跟 Linear 的计算格式、Muon 的 FP8 状态或辅助 Adam
 的 `adam_state_dtype` 绑定。主权重随机舍入可用
 `set_master_weight_dtype("bf16", rounding="stochastic", seed=42)` 单独启用。
+
+使用 `viola.set_master_weight_dtype(None)` 关闭独立主权重。绑定器直接引用模型参数，
+不创建副本；BF16/FP16 权重存储仍可配合 FP8 GEMM。纯 FP8 权重存储目前仍需要浮点
+主权重。DTensor 主权重继承输入参数的 placement，复制参数不会自动变成分片主权重。
 
 `bind_optimizer` 把优化器绑定到真实数值的主权重；`step()` 前直接引用累积梯度，
 更新后从主权重重新量化 FP8 模型权重，或写回 BF16/FP16/普通模型参数。

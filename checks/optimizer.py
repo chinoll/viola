@@ -108,10 +108,10 @@ def standalone_training():
     return dict(steps=100, initial_loss=losses[0], final_loss=losses[-1])
 
 
-def linear_integration(master="fp32", gradient="bf16"):
-    viola.set_master_weight_dtype(master, rounding="nearest" if master == "fp32" else "stochastic", seed=37)
+def linear_integration(master="fp32", gradient="bf16", weight_dtype="fp8"):
+    viola.set_master_weight_dtype(master, rounding="nearest" if master in (None, "fp32") else "stochastic", seed=37)
     viola.set_gradient_dtype(gradient)
-    model = viola.nn.Linear(64, 32, device="cuda", dtype=torch.bfloat16)
+    model = viola.nn.Linear(64, 32, device="cuda", dtype=torch.bfloat16, weight_dtype=weight_dtype)
     opt = viola.optim.bind_optimizer(model, viola.optim.FP8Muon(model.parameters(), lr=.01, tile_size=64))
     x = torch.randn(128, 64, device="cuda", dtype=torch.bfloat16)
     def update():
@@ -131,8 +131,12 @@ def linear_integration(master="fp32", gradient="bf16"):
     equal(opt.state_dict(), expected["optimizer"])
     dtypes = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}
     assert model.weight.grad.dtype == dtypes[gradient]
-    assert model._master_ref().dtype == dtypes[master]
-    return dict(microbatches=2, exact_resume=True, master=master, gradient=gradient)
+    if master is None:
+        assert model._master_ref() is model.weight
+        assert all(value is None for value in opt.state_dict()["viola_masters"]["weights"])
+    else:
+        assert model._master_ref().dtype == dtypes[master]
+    return dict(microbatches=2, exact_resume=True, master=master, gradient=gradient, weight_dtype=weight_dtype)
 
 
 def nonfinite_policy():
@@ -156,8 +160,10 @@ def main():
              ("tile", "stochastic", "gram"))]
     result = dict(gpu=torch.cuda.get_device_name(), cases=rows,
                   training=standalone_training(),
-                  linear_integration=[linear_integration(m, g) for m, g in
-                                      (("fp32", "bf16"), ("bf16", "fp32"), ("fp16", "bf16"))],
+                  linear_integration=[linear_integration(m, g, w) for m, g, w in
+                                      (("fp32", "bf16", "fp8"), ("bf16", "fp32", "fp8"),
+                                       ("fp16", "bf16", "fp8"), (None, "fp32", "bf16"),
+                                       (None, "bf16", "fp16"))],
                   nonfinite=nonfinite_policy())
     assert "deepspeed" not in sys.modules
     result["deepspeed_imported"] = False

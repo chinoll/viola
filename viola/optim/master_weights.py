@@ -14,7 +14,7 @@ class _MasterWeights:
     def __init__(self, model, optimizer):
         assert not optimizer.state, "Bind the optimizer before its first step or load_state_dict."
         config = settings()
-        self.master_dtype = config["master_weight_dtype"] or torch.float32
+        self.master_dtype = config["master_weight_dtype"]
         self.gradient_dtype = config["gradient_dtype"] or torch.float32
         self.rounding = config["master_rounding"]
         self.seed = config["master_rounding_seed"]
@@ -33,13 +33,15 @@ class _MasterWeights:
                 if id(param) not in masters:
                     layer = layers.get(id(param))
                     if layer is not None and layer.weight_dtype == "fp8":
+                        assert self.master_dtype is not None, \
+                            "Disabling the master requires BF16/FP16/FP32 weight storage."
                         initial = layer._initial_weight
                         if initial is None:
                             # Model-only checkpoint; full training resumes overwrite
                             # this with the original master from optimizer.state_dict.
                             initial = layer.dequantize_weight()
                         master = nn.Parameter(initial.to(self.master_dtype), requires_grad=param.requires_grad)
-                    elif param.dtype != self.master_dtype:
+                    elif self.master_dtype is not None and param.dtype != self.master_dtype:
                         master = nn.Parameter(param.detach().to(self.master_dtype), requires_grad=param.requires_grad)
                     else:
                         master = param
@@ -51,6 +53,8 @@ class _MasterWeights:
                     masters[id(param)] = master
                 params.append(masters[id(param)])
             group["params"] = params
+        if isinstance(optimizer, FP8Muon):
+            optimizer._partition = None
         optimizer.register_step_pre_hook(self.before_step)
         optimizer.register_step_post_hook(self.after_step)
         optimizer.register_state_dict_post_hook(self.save_masters)
@@ -121,7 +125,10 @@ class _MasterWeights:
 
     def save_masters(self, optimizer, state):
         state["viola_masters"] = {
-            "weights": [master.detach() for _, master, _ in self.pairs],
+            # Aliases are already in the model checkpoint, including the
+            # master-disabled path. Do not serialize a second weight copy.
+            "weights": [master.detach() if master is not param else None
+                        for param, master, _ in self.pairs],
             "gradient_dtype": self.gradient_dtype,
             "master_dtype": self.master_dtype,
             "rounding": self.rounding,
@@ -136,7 +143,8 @@ class _MasterWeights:
         assert len(saved["weights"]) == len(self.pairs)
         self.rounding, self.seed = saved["rounding"], saved["seed"]
         for (_, master, _), value in zip(self.pairs, saved["weights"]):
-            master.copy_(value)
+            if value is not None:
+                master.copy_(value)
         return state
 
     @torch.no_grad()
@@ -156,6 +164,8 @@ def bind_optimizer(model, optimizer):
     Move the model to its training device before binding. Save/load both model
     and optimizer state_dicts for an exact training resume. Call the independent
     precision setters before binding (defaults: FP32 master and gradient).
+    set_master_weight_dtype(None) aliases the model parameter instead of
+    allocating a master; FP8 compute with BF16/FP16 weight storage still works.
     """
     assert not hasattr(optimizer, "_viola_linear_masters"), "This optimizer is already bound."
     optimizer._viola_linear_masters = _MasterWeights(model, optimizer)

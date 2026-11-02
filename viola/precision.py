@@ -3,7 +3,7 @@
 import torch
 
 _DTYPES = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}
-_settings = dict(master_weight_dtype=None, gradient_dtype=None,
+_settings = dict(master_weight_dtype=torch.float32, gradient_dtype=None,
                  master_rounding="nearest", master_rounding_seed=0)
 
 
@@ -14,9 +14,9 @@ def _dtype(value):
 
 
 def set_master_weight_dtype(dtype, *, rounding="nearest", seed=0):
-    """Choose master storage/writeback for subsequent optim.bind_optimizer calls."""
+    """Choose master storage; None updates model weights without a separate copy."""
     assert rounding in ("nearest", "stochastic") and 0 <= seed < (1 << 63)
-    _settings.update(master_weight_dtype=_dtype(dtype), master_rounding=rounding,
+    _settings.update(master_weight_dtype=None if dtype is None else _dtype(dtype), master_rounding=rounding,
                      master_rounding_seed=seed)
 
 
