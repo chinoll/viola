@@ -96,6 +96,7 @@ TileLang 在寄存器内以 FP32 恢复和更新动量，产生本步 BF16 正�
 layer = viola.nn.Linear(
     1024, 4096, device="cuda", dtype=torch.bfloat16,
     mode="memory",           # memory / fast
+    weight_dtype="fp8",      # fp8 / bf16 / fp16，独立选择权重存储
     forward_dtype="e4m3",    # e4m3 / e5m2
     backward_dtype="e5m2",   # e4m3 / e5m2，独立选择
 )
@@ -106,14 +107,40 @@ layer = viola.nn.Linear(
 E5M2 × E4M3 乘法，复用前向保存的权重和输入。`backward_dtype` 不控制最终参数梯度的存储。
 量化、转置、GEMM 都由 TileLang 实现，scale 与 bias 在 GEMM 尾部融合。
 
-| 预设 | 常驻模型权重 | backward 保存的输入 | 权重转置 |
+| 权重存储 | 预设 | 常驻模型权重 | 权重转置 |
 | --- | --- | --- | --- |
-| `memory` | FP8 W | FP8 X.T | dX 时生成，随后释放 |
-| `fast` | FP8 W + W.T | FP8 X.T | 跨 microbatch 复用，优化后刷新 |
+| `fp8` | `memory` | FP8 W | dX 时生成，随后释放 |
+| `fp8` | `fast` | FP8 W + W.T | 跨 microbatch 复用，优化后刷新 |
+| `bf16` / `fp16` | `memory` | BF16 / FP16 W | backward 从参数量化生成，用后释放 |
+| `bf16` / `fp16` | `fast` | BF16 / FP16 W | forward 生成临时 FP8 W.T，仅保存至本次 backward |
+
+三种权重存储都使用 FP8 GEMM。BF16/FP16 存储示例：
+
+```python
+layer = viola.nn.Linear(
+    1024, 4096, device="cuda", dtype=torch.bfloat16,
+    weight_dtype="bf16", mode="memory",  # 也可设为 fp16
+    forward_dtype="e4m3", backward_dtype="e5m2",
+    scaling="grouped",             # current / delayed / grouped / mxfp8
+    weight_group_shape=(32, 32),
+)
+```
+
+`weight_dtype="bf16"/"fp16"` 的参数和模型 checkpoint 存对应精度的真实权重。forward 临时量化 W，
+GEMM 后释放 FP8 W；默认 backward 再从这些权重量化 W.T，不保留跨 microbatch 的
+FP8 权重缓存。`cache_weight_transpose=True` 可保存当前 forward 的 W.T 到 backward，
+其生命周期与该次计算图相同。`delayed` 模式的 backward 使用对应 forward 保存的 scale，
+不重复推进权重统计。分组模式直接从 BF16/FP16 W 分别量化两个方向。
+
+W、X 使用 `forward_dtype`；dY 使用 `backward_dtype`，默认反向执行 E5M2 × E4M3 GEMM。
+输入默认保存 FP8 X.T，也可以用 `saved_input_dtype="bf16"` 在 backward 再量化 X.T。
+这些选项和现有累加策略、autotune 一起使用；旋转仍适用于 `current/delayed` 缩放。
+`dtype` 控制 bias 等浮点张量，`weight_dtype` 单独控制权重存储。
 
 可独立覆盖 `cache_weight_transpose=True/False`、`saved_input_dtype="fp8"/"bf16"/"fp16"/"fp32"`、
 `scaling="current"/"delayed"`、`history_len=16`。默认 per-tensor current scaling。
-W 与 W.T 共享一个 FP32 scale。已有层用 `viola.nn.Linear.from_float(nn_linear, ...)` 转换。
+per-tensor 模式的 W 与 W.T 共享一个 FP32 scale。已有层用
+`viola.nn.Linear.from_float(nn_linear, weight_dtype="bf16", ...)` 转换；默认存储仍为 `fp8`。
 
 需要局部缩放时，可使用普通 FP8 MMA 配合 FP32 scale，或 RTX Blackwell 的原生 MXFP8：
 
@@ -146,8 +173,9 @@ FP32 累加，不与 `rotation_size` 组合；`grouped` 支持 FP16 局部累加
 X.T 和 dY.T 直接从浮点输入独立量化，FP8 输入保存模式只保留 dW 所需的 X.T。
 W 的二维分块两边均至少为 32 时，转置仅调整 FP8 数据和 scale 的布局；一维 W
 或行分组小于 32 时，需要在转置方向重新分组量化。默认的二维权重分块可避免这次额外量化。
-`memory` 在 dX 时生成 W.T 并释放，`fast` 缓存 W.T 和对应 scale。恢复 checkpoint 时
-使用相同的 scaling、分组形状和 FP8 格式。
+FP8 权重存储时，`memory` 在 dX 时生成 W.T 并释放，`fast` 缓存 W.T 和对应 scale。
+BF16/FP16 权重存储时，W.T 直接从参数量化。恢复 checkpoint 时使用相同的
+weight_dtype、scaling、分组形状和 FP8 格式。
 
 分组后端的 `autotune=True` 搜索计算 tile、K 分块、线程数、流水级数、scale 的 shared
 memory 缓存和异步搬运配置。候选先验证数值和重复执行的一致性，再计时；结果按 GPU、形状、精度、分组、
@@ -155,7 +183,7 @@ memory 缓存和异步搬运配置。候选先验证数值和重复执行的一�
 
 可选 `rotation_size=64` 在每 64 个输入通道内做固定 Regular Hadamard 变换，再量化为
 FP8；默认 `0` 保持原路径。它要求输入通道数是 64 的倍数，适合对离群值敏感的层做消融。
-主权重仍在原坐标系中，优化后才生成旋转 FP8 权重。反向复用旋转后的 FP8 张量，并将
+主权重和 BF16/FP16 参数仍在原坐标系中，生成计算用 FP8 权重时才做旋转。反向使用旋转后的 FP8 张量，并将
 dX/dW 原地逆旋转回原坐标；不额外保留完整的浮点旋转副本。此选项不改变 FP8 格式、
 per-tensor scale 或累加策略，也不保证所有分布的误差都会降低。
 `layer.dequantize_weight()` 返回原坐标下的解量化权重。恢复 checkpoint 时使用相同的
@@ -225,7 +253,9 @@ viola.optim.bind_optimizer(model, optimizer)
 `set_master_weight_dtype("bf16", rounding="stochastic", seed=42)` 单独启用。
 
 `bind_optimizer` 把优化器绑定到真实数值的主权重；`step()` 前直接引用累积梯度，
-更新后从主权重重新量化 FP8 模型权重，或写回普通模型参数。
+更新后从主权重重新量化 FP8 模型权重，或写回 BF16/FP16/普通模型参数。
+模型存储与优化器主权重独立：默认主权重仍为 FP32；选择与 BF16/FP16 参数相同精度的
+主权重时可直接复用参数，不再额外分配主权重副本。
 不保存第二份高精度梯度。它也支持普通 AdamW：主权重和梯度 dtype 不同时使用
 Viola 的 TileLang AdamW 更新，不做整份梯度升精度复制。
 
@@ -247,6 +277,7 @@ Viola 的 TileLang AdamW 更新，不做整份梯度升精度复制。
 pip install -r requirements.txt
 PYTHONPATH=. python examples/train.py
 PYTHONPATH=. python examples/linear.py
+PYTHONPATH=. python examples/linear.py --weight-dtype fp16 --scaling grouped
 
 # 普通 DDP 示例：各 rank 持有自己的完整优化器状态。
 PYTHONPATH=. torchrun --standalone --nproc_per_node=2 examples/train.py

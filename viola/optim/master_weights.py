@@ -1,4 +1,4 @@
-"""Bind ordinary optimizers to real master values behind FP8 Linear weights."""
+"""Bind optimizers to master weights with independent model storage precision."""
 
 import weakref
 
@@ -32,19 +32,20 @@ class _MasterWeights:
                 param.grad_dtype = self.gradient_dtype
                 if id(param) not in masters:
                     layer = layers.get(id(param))
-                    if layer is not None:
+                    if layer is not None and layer.weight_dtype == "fp8":
                         initial = layer._initial_weight
                         if initial is None:
                             # Model-only checkpoint; full training resumes overwrite
                             # this with the original master from optimizer.state_dict.
                             initial = layer.dequantize_weight()
                         master = nn.Parameter(initial.to(self.master_dtype), requires_grad=param.requires_grad)
-                        layer._initial_weight = None
-                        layer._master_ref = weakref.ref(master)
                     elif param.dtype != self.master_dtype:
                         master = nn.Parameter(param.detach().to(self.master_dtype), requires_grad=param.requires_grad)
                     else:
                         master = param
+                    if layer is not None:
+                        layer._initial_weight = None
+                        layer._master_ref = weakref.ref(master)
                     master.grad_dtype = self.gradient_dtype
                     self.pairs.append((param, master, layer))
                     masters[id(param)] = master
@@ -144,7 +145,7 @@ class _MasterWeights:
         # histories. Do not quantize again here: delayed scaling would advance
         # its history and change the restored model before its next update.
         for param, master, layer in self.pairs:
-            if layer is None and param is not master:
+            if (layer is None or layer.weight_dtype != "fp8") and param is not master:
                 param.copy_(master)
         optimizer.zero_grad()
 

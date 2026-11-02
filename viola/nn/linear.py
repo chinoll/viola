@@ -1,4 +1,4 @@
-"""FP8 model weights, FP8 saved activations, and TileLang forward/backward."""
+"""FP8/BF16/FP16 weight storage with TileLang FP8 forward/backward."""
 
 import math
 
@@ -44,9 +44,18 @@ class _Linear(torch.autograd.Function):
         save_fp8 = need_backward and weight.requires_grad and layer.saved_input_dtype == "fp8"
         qx, qxt = quantize(x, sx, transpose=save_fp8, fp8_dtype=layer.fp8_dtype,
                                   quantization_limit=input_limit)
-        y = kernels.gemm(qx, weight, sx, layer.weight_scale, out_dtype=x.dtype, bias=bias,
+        if layer.weight_dtype != "fp8":
+            weight_limit = layer._quantization_limit(max(weight.shape), layer.fp8_dtype)
+            sw = layer.weight_quantizer.scale(weight, layer.fp8_dtype, weight_limit, layer.rotation_size)
+            qw, wt = quantize(weight, sw, fp8_dtype=layer.fp8_dtype,
+                              transpose=need_backward and ctx.needs_input_grad[0] and layer.cache_weight_transpose,
+                              quantization_limit=weight_limit)
+        else:
+            qw, sw, wt = weight, layer.weight_scale, layer.weight_transpose
+        y = kernels.gemm(qx, qw, sx, sw, out_dtype=x.dtype, bias=bias,
                          autotune=layer.autotune, accum_dtype=layer.accum_dtype,
                          accum_block_size=layer.accum_block_size, accum_reduce_dtype=layer.accum_reduce_dtype)
+        del qw
 
         if need_backward:
             if save_fp8:
@@ -57,8 +66,7 @@ class _Linear(torch.autograd.Function):
             else:
                 saved_x = x.new_empty(0)
             # Save the exact scale used for this tensor, not a mutable quantizer state.
-            ctx.save_for_backward(saved_x, sx, weight, layer.weight_scale,
-                                  layer.weight_transpose)
+            ctx.save_for_backward(saved_x, sx, weight, sw, wt)
             ctx.layer, ctx.shape, ctx.x_dtype = layer, shape, x.dtype
             ctx.save_fp8 = save_fp8
             ctx.input_limit = input_limit
@@ -81,7 +89,15 @@ class _Linear(torch.autograd.Function):
                                   fp8_dtype=layer.backward_fp8_dtype, quantization_limit=grad_limit)
         dx = dw = db = None
         if needs_x:
-            wt = cached_wt if cached_wt.numel() else kernels.transpose(weight)
+            if cached_wt.numel():
+                wt = cached_wt
+            elif layer.weight_dtype != "fp8":
+                quantize = rotation.quantize if layer.rotation_size else kernels.quantize
+                # Reuse this forward's scale; do not advance delayed history in backward.
+                _, wt = quantize(weight, sw, rowwise=False, transpose=True, fp8_dtype=layer.fp8_dtype,
+                                  quantization_limit=layer._quantization_limit(max(weight.shape), layer.fp8_dtype))
+            else:
+                wt = kernels.transpose(weight)
             dx = kernels.gemm(qg, wt, sg, sw, out_dtype=ctx.x_dtype, autotune=layer.autotune,
                               accum_dtype=layer.accum_dtype, accum_block_size=layer.accum_block_size,
                               accum_reduce_dtype=layer.accum_reduce_dtype)
@@ -111,23 +127,22 @@ class _Linear(torch.autograd.Function):
                 rotation.inverse_(dw)
         if needs_b:
             db = dy.sum(dim=0, dtype=ctx.bias_grad_dtype)
-        # These are derivatives w.r.t. real weights; the optimizer updates their
-        # master values, never the scaled FP8 codes.
+        # Derivatives refer to real weights, including when storage uses FP8 codes.
         return dx, dw, db, None, None
 
 
 class Linear(nn.Module):
-    """A CUDA FP8 Linear with two storage presets and independent overrides.
+    """A CUDA FP8 Linear with configurable weight storage and caching.
 
     Construct/move the model, construct its optimizer, then call
     ``viola.optim.bind_optimizer(model, optimizer)`` before training. Forward inputs
-    and outputs are ordinary FP16/BF16/FP32 tensors. ``weight`` stores FP8 codes;
-    decoded weights are available through ``dequantize_weight()`` (including
-    the inverse transform when ``rotation_size=64``).
+    and outputs are ordinary FP16/BF16/FP32 tensors. ``weight_dtype`` selects FP8
+    codes or BF16/FP16 real weights. All storage formats compute with FP8 GEMMs.
+    ``dequantize_weight()`` returns real weights in the original coordinates.
     """
 
     def __init__(self, in_features, out_features, bias=True, *, mode="memory",
-                 forward_dtype="e4m3", backward_dtype="e5m2",
+                 weight_dtype="fp8", forward_dtype="e4m3", backward_dtype="e5m2",
                  cache_weight_transpose=None, saved_input_dtype="fp8",
                  scaling="current", history_len=16, autotune=False, accum_dtype="fp32",
                  accum_block_size=0, accum_reduce_dtype="fp32", quantization_limit=None,
@@ -136,6 +151,8 @@ class Linear(nn.Module):
                  device=None, dtype=None):
         super().__init__()
         assert mode in ("memory", "fast")
+        assert weight_dtype in ("fp8", "bf16", "fp16")
+        self.weight_dtype = weight_dtype
         formats = {"e4m3": torch.float8_e4m3fn, "e5m2": torch.float8_e5m2}
         self.forward_dtype, self.backward_dtype = forward_dtype, backward_dtype
         self.fp8_dtype, self.backward_fp8_dtype = formats[forward_dtype], formats[backward_dtype]
@@ -171,19 +188,23 @@ class Linear(nn.Module):
         master_dtype = config["master_weight_dtype"] or torch.float32
         gradient_dtype = config["gradient_dtype"] or torch.float32
         dtype = dtype or torch.get_default_dtype()
-        # This allocation becomes the optimizer's master without cloning it.
-        # It is not a second high-precision model weight retained after binding.
-        self._initial_weight = torch.empty((out_features, in_features), device=device, dtype=master_dtype)
+        # FP8 initialization is handed to the optimizer as its master. BF16/FP16
+        # storage starts directly in the parameter, without an initializer copy.
+        self._initial_weight = (torch.empty((out_features, in_features), device=device, dtype=master_dtype)
+                                if weight_dtype == "fp8" else None)
         self._master_ref = None
-        self.weight = nn.Parameter(torch.empty((out_features, in_features), device=device, dtype=self.fp8_dtype))
+        storage_dtype = {"fp8": self.fp8_dtype, "bf16": torch.bfloat16, "fp16": torch.float16}[weight_dtype]
+        self.weight = nn.Parameter(torch.empty((out_features, in_features), device=device, dtype=storage_dtype))
         self.weight.grad_dtype = gradient_dtype
         self.bias = nn.Parameter(torch.empty(out_features, device=device, dtype=dtype)) if bias else None
         if self.bias is not None:
             self.bias.grad_dtype = gradient_dtype
         scale_shape = grouped.scale_shape((out_features, in_features), self.weight_group_shape) if self._grouped_scaling else (1,)
+        if weight_dtype != "fp8":
+            scale_shape = (0, 0) if self._grouped_scaling else (0,)
         scale_dtype = torch.uint8 if self._native_scaling else torch.float32
         self.register_buffer("weight_scale", torch.full(scale_shape, 127 if self._native_scaling else 1,
-                                                       device=device, dtype=scale_dtype))
+                                                       device=device, dtype=scale_dtype), persistent=weight_dtype == "fp8")
         self.register_buffer("weight_transpose", torch.empty(0, 0, device=device, dtype=self.fp8_dtype), persistent=False)
         if self._grouped_scaling:
             self.register_buffer("weight_transpose_scale", torch.empty(0, 0, device=device, dtype=scale_dtype), persistent=False)
@@ -223,7 +244,8 @@ class Linear(nn.Module):
 
     @torch.no_grad()
     def reset_parameters(self):
-        master = self._master_ref() if self._master_ref is not None else self._initial_weight
+        master = self._master_ref() if self._master_ref is not None else (
+            self.weight if self.weight_dtype != "fp8" else self._initial_weight)
         nn.init.kaiming_uniform_(master, a=math.sqrt(5))
         if self.bias is not None:
             nn.init.uniform_(self.bias, -1 / math.sqrt(self.in_features), 1 / math.sqrt(self.in_features))
@@ -232,6 +254,10 @@ class Linear(nn.Module):
     @torch.no_grad()
     def refresh_weight(self, master):
         """Called after an optimizer update, directly from its updated master."""
+        if self.weight_dtype != "fp8":
+            if master is not self.weight:
+                self.weight.copy_(master)
+            return
         if self._grouped_scaling:
             if self._native_scaling and master.is_cuda:
                 assert torch.cuda.get_device_capability(master.device)[0] == 12, "Native MXFP8 backend targets SM120/SM121."
@@ -270,6 +296,8 @@ class Linear(nn.Module):
                 self.weight_transpose.copy_(self.weight.T)
 
     def dequantize_weight(self):
+        if self.weight_dtype != "fp8":
+            return self.weight.float()
         if self._grouped_scaling:
             return grouped.dequantize(self.weight, self.weight_scale, self.weight_group_shape)
         weight = self.weight.float() * self.weight_scale
@@ -282,11 +310,12 @@ class Linear(nn.Module):
     def from_float(cls, linear, **kwargs):
         layer = cls(linear.in_features, linear.out_features, linear.bias is not None,
                     device=linear.weight.device, dtype=linear.weight.dtype, **kwargs)
-        layer._initial_weight.copy_(linear.weight)
+        master = layer.weight if layer.weight_dtype != "fp8" else layer._initial_weight
+        master.copy_(linear.weight)
         # A pretrained weight must not inherit the temporary initializer's amax.
         layer.weight_quantizer.history.zero_()
         layer.weight_quantizer.index = 0
-        layer.refresh_weight(layer._initial_weight)
+        layer.refresh_weight(master)
         if linear.bias is not None:
             layer.bias.copy_(linear.bias)
         layer.weight.requires_grad_(linear.weight.requires_grad)
@@ -308,8 +337,8 @@ class Linear(nn.Module):
         return _Linear.apply(x, self.weight, self.bias, self, need_backward)
 
     def _apply(self, fn, recurse=True):
-        # .cuda()/.to() move payloads, but .bfloat16() must not cast the FP8 codes
-        # or scale/history tensors. Move the model before binding its optimizer.
+        # Device moves preserve the selected weight storage and scale/history
+        # dtypes. Move the model before binding its optimizer.
         weight = self._parameters["weight"]
         self._parameters["weight"] = None
         grad_dtype = weight.grad_dtype
@@ -335,10 +364,11 @@ class Linear(nn.Module):
         return self
 
     def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
-        assert state_dict[prefix + "weight"].dtype == self.fp8_dtype, "Construct Linear with the checkpoint's FP8 format."
+        expected = {"fp8": self.fp8_dtype, "bf16": torch.bfloat16, "fp16": torch.float16}[self.weight_dtype]
+        assert state_dict[prefix + "weight"].dtype == expected, "Construct Linear with the checkpoint's weight storage and FP8 format."
         super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
         self._initial_weight = None
-        if self.cache_weight_transpose:
+        if self.cache_weight_transpose and self.weight_dtype == "fp8":
             if self._grouped_scaling:
                 self.weight_transpose, self.weight_transpose_scale = grouped.transpose(
                     self.weight, self.weight_scale, self.weight_group_shape, native=self._native_scaling,
@@ -352,7 +382,7 @@ class Linear(nn.Module):
         groups = (f", weight_group_shape={self.weight_group_shape}, input_group_shape={self.input_group_shape}, "
                   f"grad_group_shape={self.grad_group_shape}" if self._grouped_scaling else "")
         return (f"in_features={self.in_features}, out_features={self.out_features}, "
-                f"bias={self.bias is not None}, mode={self.mode!r}, "
+                f"bias={self.bias is not None}, mode={self.mode!r}, weight_dtype={self.weight_dtype!r}, "
                 f"forward_dtype={self.forward_dtype!r}, backward_dtype={self.backward_dtype!r}, "
                 f"cache_weight_transpose={self.cache_weight_transpose}, "
                 f"saved_input_dtype={self.saved_input_dtype!r}, autotune={self.autotune}, "

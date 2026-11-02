@@ -1,4 +1,4 @@
-"""Autograd for grouped FP8 and native MXFP8; saved inputs remain FP8."""
+"""Grouped/MXFP8 autograd with FP8 or BF16/FP16 weight storage."""
 
 import torch
 
@@ -13,9 +13,18 @@ class GroupedLinear(torch.autograd.Function):
         gx, gw = layer.input_group_shape, layer.weight_group_shape
         limit = layer._group_limit(gx, layer.fp8_dtype)
         qx, sx = kernels.quantize(x, layer.fp8_dtype, gx, native=layer._native_scaling, limit=limit)
-        y = layer._group_gemm(qx, weight, sx, layer.weight_scale, gx, gw, out_dtype=x.dtype, bias=bias)
-        del qx, sx
+        if layer.weight_dtype != 'fp8':
+            weight_limit = layer._group_limit(gw, layer.fp8_dtype, weight=True)
+            qw, sw = kernels.quantize(weight, layer.fp8_dtype, gw, native=layer._native_scaling, limit=weight_limit)
+        else:
+            qw, sw = weight, layer.weight_scale
+        y = layer._group_gemm(qx, qw, sx, sw, gx, gw, out_dtype=x.dtype, bias=bias)
+        del qx, sx, qw
         if need_backward:
+            wt, st = layer.weight_transpose, layer.weight_transpose_scale
+            if layer.weight_dtype != 'fp8' and ctx.needs_input_grad[0] and layer.cache_weight_transpose:
+                wt, st = kernels.quantize(weight, layer.fp8_dtype, kernels.transpose_group(gw),
+                                          native=layer._native_scaling, limit=weight_limit, transposed=True)
             save_fp8 = weight.requires_grad and layer.saved_input_dtype == 'fp8'
             if save_fp8:
                 saved_x, saved_scale = kernels.quantize(x, layer.fp8_dtype, gx, native=layer._native_scaling,
@@ -25,8 +34,7 @@ class GroupedLinear(torch.autograd.Function):
                 saved_x, saved_scale = x.to(dtype), x.new_empty(0)
             else:
                 saved_x, saved_scale = x.new_empty(0), x.new_empty(0)
-            ctx.save_for_backward(saved_x, saved_scale, weight, layer.weight_scale,
-                                  layer.weight_transpose, layer.weight_transpose_scale)
+            ctx.save_for_backward(saved_x, saved_scale, weight, sw, wt, st)
             ctx.layer, ctx.shape, ctx.x_dtype = layer, shape, x.dtype
             ctx.save_fp8, ctx.input_limit = save_fp8, limit
             ctx.weight_grad_dtype = weight.grad_dtype
@@ -46,6 +54,9 @@ class GroupedLinear(torch.autograd.Function):
             qg, sg = kernels.quantize(dy, layer.backward_fp8_dtype, gg, native=native, limit=limit)
             if cached_wt.numel():
                 wt, st = cached_wt, cached_st
+            elif layer.weight_dtype != 'fp8':
+                wt, st = kernels.quantize(w, layer.fp8_dtype, kernels.transpose_group(gw), native=native,
+                                          limit=layer._group_limit(gw, layer.fp8_dtype, weight=True), transposed=True)
             else:
                 wt, st = kernels.transpose(w, sw, gw, native=native, limit=layer._group_limit(gw, layer.fp8_dtype, weight=True))
             dx = layer._group_gemm(qg, wt, sg, st, gg, kernels.transpose_group(gw), out_dtype=ctx.x_dtype).reshape(ctx.shape)
