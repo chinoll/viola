@@ -1,4 +1,4 @@
-# Viola · FP8 Linear & Muon
+# Viola · FP8 Linear, Muon & Distributed Training
 
 用 TileLang 实现低精度算子与优化器，优先减少训练中的常驻显存。
 
@@ -15,10 +15,147 @@ viola.optim.bind_optimizer(model, optimizer)
 | `viola.nn` | FP8 `Linear` 与融合门控 `MLP` |
 | `viola.optim` | 独立的 `FP8Muon` 优化器与 `bind_optimizer` 主权重绑定 |
 | `viola.precision` | 主权重、参数梯度的独立精度策略 |
-| `viola.distributed` | DTensor 通信、完整矩阵归属与分片 EMA |
+| `viola.distributed` | `violaEngine`、独立状态分片、DTensor 通信与 EMA |
 
-使用普通 PyTorch `backward()` / `optimizer.step()`。不依赖或兼容 DeepSpeed，
-没有全局优化器替换、ZeRO 钩子或旧插件入口。
+单卡使用普通 PyTorch `backward()` / `optimizer.step()`；分布式训练使用 `violaEngine`。
+不依赖 Accelerate 或 DeepSpeed。
+
+## violaEngine 分布式训练
+
+计算权重、梯度、优化器和 EMA 分别选择是否分片。参数分片复用 FSDP2 的权重收集与释放；
+梯度累积和优化器更新由 Viola 管理。Muon 的正交化始终作用于完整逻辑矩阵。
+
+```yaml
+num_processes: 2
+mixed_precision: bf16
+gradient_accumulation_steps: 2
+
+sharding:
+  parameters: true
+  gradients: true
+  optimizer: true
+  ema: true
+  # blocks: ["blocks.*"]
+
+precision:
+  master_weight_dtype: fp32
+  gradient_dtype: fp32
+
+ema:
+  decay: 0.9999   # 0 关闭 EMA
+  dtype: fp32
+```
+
+| 配置 | 关闭分片 | 开启分片 |
+| --- | --- | --- |
+| `sharding.parameters` | 每卡保留完整计算权重 | FSDP2 按行保存 DTensor，逐组收集计算、计算后释放 |
+| `sharding.gradients` | 每卡累积完整梯度，更新前归约 | 每个 microbatch 归约到矩阵 owner，只在 owner 累积 |
+| `sharding.optimizer` | 每卡保存优化器状态与可选主权重 | 按完整参数分配状态与主权重，每个矩阵只由其 owner 更新 |
+| `sharding.ema` | 每卡保存完整 EMA | 按完整参数分配 EMA，与优化器开关独立 |
+
+`precision.master_weight_dtype: null` 不保留额外的主权重副本。计算权重分片时，更新所需的
+完整浮点矩阵临时收集，更新后释放；计算权重存为 FP8 时仍需要浮点主权重。
+
+模型内部仍使用普通 Tensor 运算。默认把 `ModuleList` / `Sequential` 的顶层元素作为
+参数收集单元，也可用 `sharding.blocks` 指定模块路径或通配符。跨单元共享的参数由根单元
+统一管理。没有指定 block 且没有这些容器时，根模块作为一个单元，峰值会包含整模型权重。
+自定义 forward 若直接读取子模块权重，应将包含这段计算的父模块声明为一个 block。
+分片单元之间使用非原地残差连接，例如 `x = x + residual`。Engine 为父子单元建立独立的
+反向 hook 边界，返回的 view 不额外占用激活存储，但不能在该输出上做原地修改。
+
+完整示例：[配置](examples/distributed.yaml)、[训练脚本](examples/train_distributed.py)。
+
+```bash
+PYTHONPATH=. python -m viola launch --config examples/distributed.yaml examples/train_distributed.py
+# FP8 计算与权重存储
+PYTHONPATH=. python -m viola launch --config examples/distributed.yaml examples/train_distributed.py --fp8
+```
+
+```python
+engine = viola.violaEngine("examples/distributed.yaml")
+model = engine.prepare_model(model)
+optimizer = engine.prepare_optimizer(
+    lambda params: viola.optim.FP8Muon(params, lr=1e-3)
+)
+loader = engine.prepare_dataloader(loader)
+
+for epoch in range(num_epochs):
+    loader.sampler.set_epoch(epoch)
+    for batch in loader:
+        with engine.accumulate():
+            with engine.autocast():
+                loss = compute_loss(model, batch, engine.device)
+            engine.backward(loss)
+            engine.step(scheduler=scheduler)
+    engine.step(scheduler=scheduler, force=True)
+```
+
+Engine 负责主权重绑定，不再额外调用 `bind_optimizer`。`backward()` 接收本卡平均 loss，
+`step()` 在累积完成后更新权重、EMA 和 scheduler，并返回是否实际更新。
+不同 rank 的有效 token 数不同时，使用 `engine.backward(loss, weight=valid_tokens)`，
+按整个累积窗口的全局 token 数归一化。
+
+EMA 评估和 checkpoint 由所有 rank 调用：
+
+```python
+with engine.ema_scope() as averaged_model:
+    evaluate(averaged_model)
+
+engine.save_checkpoint("checkpoints/step-1000", scheduler=scheduler, extra={"epoch": epoch})
+extra = engine.load_checkpoint("checkpoints/step-1000", scheduler=scheduler)
+```
+
+checkpoint 包含一份 CPU 完整模型，以及每个 rank 的主权重、优化器、EMA、随机数状态和步数。
+在更新边界保存；恢复时保持相同卡数、参数顺序、分片和精度配置。数据读取位置通过 `extra`
+保存。普通 map-style DataLoader 自动按 DP 分配；自定义 batch sampler 和流式数据由调用方分配。
+
+当前 Engine 使用一维 DP mesh；TP、CP、PP 的模型声明与执行尚未接入。
+参数分片与优化器分片粒度不同：前者按行，后者按完整矩阵，状态占用可能因矩阵大小不均衡。
+梯度分片开启、优化器分片关闭时，更新前需要把 owner 梯度收集到各副本。
+EMA 复制、优化器分片时，EMA 更新需要同步高精度源权重。
+
+参数分片模式暂在一个 microbatch 的 backward 完成后进行梯度归约，以避免 FSDP 权重
+all-gather 与存在未使用参数时的梯度通信次序冲突。因此峰值仍包含该 microbatch 的临时完整梯度；
+microbatch 之间仅保留配置指定的梯度累积。复制权重模式在梯度桶就绪后归约。
+通信暂未实现独立执行流重叠。使用非重入 activation checkpoint；不自动添加梯度裁剪或 loss scaling。
+混合 FP8 / BF16 存储使用 `fsdp.py` 中局部的 FSDP dtype 初始化适配：参数 gather 保留各自 dtype，
+梯度由 Viola 归约。此处依赖 FSDP 内部接口，升级 PyTorch 时需要验证。
+FP8 模块的 `fast` 配置仍可在反向前保留转置权重；要减少这一部分峰值，选 `mode="memory"`。
+
+### FP8 梯度通信
+
+通信精度独立于参数、主权重和梯度累积精度：
+
+```yaml
+communication:
+  dtype: fp8       # 默认沿用 gradient_dtype；也可用 fp32 / bf16 / fp16
+  fp8_format: e4m3
+  fp8_tile_size: 256
+  bucket_mb: 25
+```
+
+TileLang 按一维 tile 计算 FP32 scale，将 FP8 数据与 scale 编码为字节包；NCCL 传递
+`uint8`，接收端解量化后在 FP32 中求和。梯度分片使用 reduce-to-owner，复制梯度使用
+all-reduce 路径，后者包含第二次量化。NaN/Inf 会继续传播，不会被替换为有限梯度。
+FP8 编解码需要 CUDA；实际吞吐取决于桶大小和互联。
+
+### 编写矩阵优化器
+
+继承 `viola.optim.MatrixOptimizer`，只实现完整矩阵上的数值更新：
+
+```python
+class MyMatrixOptimizer(viola.optim.MatrixOptimizer):
+    def __init__(self, params, lr=1e-3):
+        super().__init__(params, dict(lr=lr))
+
+    def _step_local(self, parameter, gradient, state, group, index):
+        # parameter / gradient 是完整的普通 Tensor。
+        # state 按优化器分片策略存放，index 在不同分片方式下保持一致。
+        parameter.add_(gradient, alpha=-group["lr"])
+```
+
+`FP8Muon` 已使用这个基类。独立传入 DTensor 时，基类负责完整矩阵收集、更新与写回，
+`shard_state=False` 可保留复制的优化器状态；通过 Engine 使用时，由四项分片配置统一管理。
 
 ## FP8 Muon
 
@@ -152,8 +289,8 @@ EMA 绑定 optimizer 的 post-step hook，用户不用写更新循环。`decay=0
 PYTHONPATH=. torchrun --standalone --nproc-per-node=2 examples/train_dtensor.py --ema-decay 0.9999
 ```
 
-当前交付的是布局、通信、优化器和 EMA 底座；尚未接入 `violaEngine` 的
-`viola1`／`viola2` 调度、FSDP2，或 Viola FP8 Linear/MLP 的 DTensor 算子边界。
+上述 DTensor 接口也可独立使用。`violaEngine` 管理参数的分片与完整计算视图，
+不要求 Viola FP8 Linear/MLP 的算子直接接收 DTensor。
 
 ## FP8 Linear
 

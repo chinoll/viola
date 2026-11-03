@@ -12,6 +12,7 @@ import torch.distributed as dist
 from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
 
 
+
 def partial_gradient(local, mesh, *, average=True):
     """Describe unsynchronized gradients of local mean losses, without a copy.
 
@@ -33,6 +34,39 @@ def _packed_shape(value, dim):
     shape = list(value.shape)
     width = math.ceil(shape.pop(dim) / value.device_mesh.size())
     return (width, *shape)
+
+
+def wire_tensor(value):
+    """NCCL transports FP8 codes byte-for-byte, without interpreting them."""
+    return value.view(torch.uint8) if value.dtype in (torch.float8_e4m3fn, torch.float8_e5m2) else value
+
+
+@torch.no_grad()
+def replicate_tensor(value):
+    """Materialize one DTensor as a full tensor, including FP8 storage."""
+    if not isinstance(value, DTensor):
+        return value.detach()
+    mesh, group, _ = _mesh(value)
+    placement, = value.placements
+    local = value.to_local()
+    if isinstance(placement, Replicate):
+        return local
+    if isinstance(placement, Partial):
+        result = local.contiguous().clone()
+        dist.all_reduce(result, group=group)
+        if placement.reduce_op == "avg":
+            result.div_(mesh.size())
+        else:
+            assert placement.reduce_op == "sum"
+        return result
+    dim = placement.dim % value.ndim
+    shape = _packed_shape(value, dim)
+    moved = local.movedim(dim, 0)
+    packed = torch.zeros(shape, device=local.device, dtype=local.dtype)
+    packed[:moved.shape[0]].copy_(moved)
+    result = torch.empty((mesh.size(), *shape), device=local.device, dtype=local.dtype)
+    dist.all_gather(list(wire_tensor(result).unbind(0)), wire_tensor(packed), group=group)
+    return result.flatten(0, 1)[:value.shape[dim]].movedim(0, dim).contiguous()
 
 
 @torch.no_grad()
@@ -70,7 +104,7 @@ def gather_to_owner(value, owner):
         packed[:moved.shape[0]].copy_(moved)
     received = (torch.empty((mesh.size(), *packed_shape), device=local.device,
                             dtype=local.dtype) if rank == owner else None)
-    dist.gather(packed, list(received.unbind(0)) if received is not None else None,
+    dist.gather(wire_tensor(packed), list(wire_tensor(received).unbind(0)) if received is not None else None,
                 dst=dst, group=group)
     if received is not None:
         return received.flatten(0, 1)[:value.shape[dim]].movedim(0, dim).contiguous()
@@ -90,7 +124,7 @@ def write_from_owner(target, full, owner):
         buffer = local.contiguous()
         if rank == owner:
             buffer.copy_(full)
-        dist.broadcast(buffer, src=src, group=group)
+        dist.broadcast(wire_tensor(buffer), src=src, group=group)
         local.copy_(buffer)
     else:
         assert isinstance(placement, Shard)
@@ -107,7 +141,7 @@ def write_from_owner(target, full, owner):
                 packed[:target.shape[dim]].copy_(moved)
             packed = packed.view(mesh.size(), *packed_shape)
         received = torch.empty(packed_shape, device=local.device, dtype=local.dtype)
-        dist.scatter(received, list(packed.unbind(0)) if packed is not None else None,
+        dist.scatter(wire_tensor(received), list(wire_tensor(packed).unbind(0)) if packed is not None else None,
                      src=src, group=group)
         local.copy_(received[:local.shape[dim]].movedim(0, dim))
     torch.autograd.graph.increment_version(target)

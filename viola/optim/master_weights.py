@@ -7,7 +7,39 @@ from torch import nn
 
 from ..nn import Linear
 from ..precision import settings
-from .muon import FP8Muon
+from .matrix import MatrixOptimizer
+
+
+@torch.no_grad()
+def step_mixed_adamw(optimizer, precision):
+    """Update mixed-dtype AdamW entries; let native step handle other entries."""
+    restored = []
+    rounding = precision["master_rounding"]
+    for group in optimizer.param_groups:
+        for parameter in group["params"]:
+            gradient = parameter.grad
+            if gradient is None:
+                continue
+            mixed = gradient.dtype != parameter.dtype or rounding != "nearest"
+            if mixed and type(optimizer) is torch.optim.AdamW:
+                assert not any(group.get(key, False) for key in ("amsgrad", "capturable", "differentiable", "fused"))
+                from ._kernels import adam_update
+                state = optimizer.state[parameter]
+                if not state:
+                    state.update(step=torch.tensor(0.), exp_avg=torch.zeros_like(parameter),
+                                 exp_avg_sq=torch.zeros_like(parameter))
+                state["step"] += 1
+                adam_update(parameter, gradient, state["exp_avg"], state["exp_avg_sq"],
+                            lr=group["lr"], weight_decay=group["weight_decay"],
+                            betas=group["betas"], eps=group["eps"], step=int(state["step"]),
+                            rounding=rounding, key=precision["master_rounding_seed"],
+                            maximize=group.get("maximize", False))
+                restored.append((parameter, gradient))
+                parameter.grad = None
+            elif mixed and type(optimizer) is torch.optim.SGD:
+                assert rounding == "nearest"
+                group["foreach"] = False
+    return restored
 
 
 class _MasterWeights:
@@ -24,7 +56,7 @@ class _MasterWeights:
         layers = {id(layer.weight): layer for layer in model.modules() if isinstance(layer, Linear)}
         masters = {}
         for group in optimizer.param_groups:
-            if isinstance(optimizer, FP8Muon):
+            if isinstance(optimizer, MatrixOptimizer):
                 group["master_rounding"] = self.rounding
                 group["master_rounding_seed"] = self.seed
             params = []
@@ -53,7 +85,7 @@ class _MasterWeights:
                     masters[id(param)] = master
                 params.append(masters[id(param)])
             group["params"] = params
-        if isinstance(optimizer, FP8Muon):
+        if isinstance(optimizer, MatrixOptimizer):
             optimizer._partition = None
         optimizer.register_step_pre_hook(self.before_step)
         optimizer.register_step_post_hook(self.after_step)
@@ -82,36 +114,11 @@ class _MasterWeights:
                 master.grad = param.grad  # Alias the accumulator: no second gradient buffer.
                 self.active.append((param, master, layer, param.grad))
 
-        # Native AdamW lerp_ requires identical master/gradient dtypes. For the
-        # independently configured path, reuse Viola's fused TileLang update;
-        # do not upcast the entire BF16 gradient or keep an FP32 gradient shadow.
-        for group in optimizer.param_groups:
-            for master in group["params"]:
-                if master.grad is None:
-                    continue
-                mixed = master.dtype != master.grad.dtype or self.rounding != "nearest"
-                if mixed and type(optimizer) is torch.optim.AdamW:
-                    assert not any(group.get(key, False) for key in ("amsgrad", "capturable", "differentiable", "fused"))
-                    from ._kernels import adam_update
-                    state = optimizer.state[master]
-                    if not state:
-                        state["step"] = torch.tensor(0.)
-                        state["exp_avg"] = torch.zeros_like(master)
-                        state["exp_avg_sq"] = torch.zeros_like(master)
-                    state["step"] += 1
-                    adam_update(master, master.grad, state["exp_avg"], state["exp_avg_sq"],
-                                lr=group["lr"], weight_decay=group["weight_decay"],
-                                betas=group["betas"], eps=group["eps"], step=int(state["step"]),
-                                rounding=self.rounding, key=self.seed,
-                                maximize=group.get("maximize", False))
-                    master.grad = None  # This parameter was updated; native AdamW skips it.
-                elif mixed and type(optimizer) is torch.optim.SGD:
-                    assert self.rounding == "nearest"
-                    group["foreach"] = False
+        step_mixed_adamw(optimizer, dict(master_rounding=self.rounding, master_rounding_seed=self.seed))
 
     @torch.no_grad()
     def after_step(self, optimizer, args, kwargs):
-        skipped = isinstance(optimizer, FP8Muon) and optimizer.step_was_skipped
+        skipped = isinstance(optimizer, MatrixOptimizer) and optimizer.step_was_skipped
         for param, master, layer, gradient in self.active:
             if not skipped and layer is not None:
                 layer.refresh_weight(master)

@@ -1,0 +1,24 @@
+num_processes: 2
+mixed_precision: bf16
+gradient_accumulation_steps: 2
+
+sharding:
+  parameters: true
+  gradients: true
+  optimizer: true
+  ema: true
+  # blocks: ["blocks.*"]  # Optional parameter-gather units
+
+precision:
+  master_weight_dtype: fp32  # null disables the persistent master copy
+  gradient_dtype: fp32
+
+communication:
+  dtype: fp32              # fp32 / bf16 / fp16 / fp8
+  bucket_mb: 25
+  fp8_format: e4m3
+  fp8_tile_size: 256
+
+ema:
+  decay: 0                 # 0 disables EMA; e.g. 0.9999 enables it
+  dtype: fp32

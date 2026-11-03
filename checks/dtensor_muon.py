@@ -128,7 +128,7 @@ def muon_check(mesh, device, *, dtype, quant, steps):
             torch.testing.assert_close(actual, ref, rtol=0, atol=0)
             expected_ema[index].lerp_(ref.detach().float(), .1)
             torch.testing.assert_close(ema.weights[str(index)].full_tensor(), expected_ema[index], rtol=0, atol=0)
-            if plan.is_owner(p):
+            if not optimizer.shard_state or plan.is_owner(p):
                 for name in ("momentum_q", "momentum_scale", "exp_avg", "exp_avg_sq"):
                     if name in reference.state[ref]:
                         torch.testing.assert_close(optimizer.state[p][name], reference.state[ref][name], rtol=0, atol=0)
@@ -149,7 +149,7 @@ def muon_check(mesh, device, *, dtype, quant, steps):
     dist.all_gather_object(counters, local_bytes, group=mesh.get_group())
     reference_bytes = sum(v.numel() * v.element_size() for s in reference.state.values()
                           for v in s.values() if isinstance(v, torch.Tensor))
-    assert sum(counters) == reference_bytes
+    assert sum(counters) == reference_bytes * (1 if optimizer.shard_state else world)
     ema.close()
     return dict(dtype=str(dtype), quant=quant, steps=steps, max_abs_error=max(errors),
                 optimizer_bytes_by_rank=counters, single_copy_optimizer_bytes=reference_bytes)
@@ -269,6 +269,7 @@ def main():
             (torch.float32, dict(granularity="tile", tile_size=128, rounding="nearest")),
             (torch.bfloat16, dict(granularity="tile", tile_size=256, rounding="stochastic")),
             (torch.float16, dict(granularity="block", block_shape=(16, 16), rounding="nearest")),
+            (torch.float32, dict(granularity="tile", tile_size=256, shard_state=False)),
         ):
             results["muon"].append(muon_check(mesh, device, dtype=dtype, quant=quant, steps=args.steps))
         binding_check(mesh, device)

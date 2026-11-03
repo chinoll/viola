@@ -384,6 +384,11 @@ class Linear(nn.Module):
         assert state_dict[prefix + "weight"].dtype == expected, "Construct Linear with the checkpoint's weight storage and FP8 format."
         super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
         self._initial_weight = None
+        self.rebuild_weight_cache()
+
+    @torch.no_grad()
+    def rebuild_weight_cache(self):
+        """Rebuild W.T from synchronized codes/scales, without requantizing W."""
         if self.cache_weight_transpose and self.weight_dtype == "fp8":
             if self._grouped_scaling:
                 self.weight_transpose, self.weight_transpose_scale = grouped.transpose(

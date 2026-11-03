@@ -73,3 +73,60 @@ class ShardedEMA:
         if self._hook is not None:
             self._hook.remove()
             self._hook = None
+
+
+class EMAState:
+    """EMA placement is independent of optimizer, gradient and model storage."""
+
+    def __init__(self, store, optimizer, *, decay=0, dtype=torch.float32, shard=True):
+        assert 0 <= decay < 1
+        self.store, self.optimizer = store, optimizer
+        self.decay, self.dtype, self.shard = decay, dtype, shard
+        self.updates = 0
+        self.weights = {}
+        if decay:
+            self.optimizer.materialize()
+            for record in store.records:
+                if not shard:
+                    value = optimizer.full_value(record)
+                elif record.owner == store.rank:
+                    value = optimizer.parameters[record.index].detach()
+                else:
+                    continue
+                self.weights[record.name] = value.to(dtype=dtype, copy=True)
+                del value
+            self.optimizer.release()
+
+    @torch.no_grad()
+    def update(self):
+        if not self.decay:
+            return
+        for record in self.store.records:
+            if not self.shard:
+                source = self.optimizer.full_value(record)
+            elif record.owner == self.store.rank:
+                source = self.optimizer.parameters[record.index].detach()
+            else:
+                continue
+            self.weights[record.name].mul_(self.decay).add_(source, alpha=1 - self.decay)
+            del source
+        self.updates += 1
+
+    def state_dict(self):
+        return dict(decay=self.decay, dtype=self.dtype, shard=self.shard,
+                    updates=self.updates, weights=self.weights) if self.decay else {}
+
+    @torch.no_grad()
+    def load_state_dict(self, state):
+        if not self.decay:
+            return
+        assert self.dtype == state["dtype"] and self.shard == state["shard"]
+        assert self.weights.keys() == state["weights"].keys()
+        self.decay, self.updates = state["decay"], state["updates"]
+        for name, average in self.weights.items():
+            average.copy_(state["weights"][name])
+
+    @torch.no_grad()
+    def apply(self):
+        for record in self.store.records:
+            self.store.write(record, self.weights.get(record.name), record.owner)

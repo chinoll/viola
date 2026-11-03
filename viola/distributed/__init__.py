@@ -3,5 +3,6 @@
 from .communication import gather_to_owner, partial_gradient, write_from_owner
 from .ema import ShardedEMA
 from .partition import MatrixPartition
+from .engine import violaEngine
 
-__all__ = ["MatrixPartition", "ShardedEMA", "gather_to_owner", "partial_gradient", "write_from_owner"]
+__all__ = ["violaEngine", "MatrixPartition", "ShardedEMA", "gather_to_owner", "partial_gradient", "write_from_owner"]

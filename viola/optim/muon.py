@@ -5,11 +5,8 @@ import warnings
 from functools import partial
 
 import torch
-import torch.distributed as dist
-from torch.distributed.tensor import DTensor
 
-from ..distributed.communication import gather_to_owner, write_from_owner
-from ..distributed.partition import MatrixPartition
+from .matrix import MatrixOptimizer
 from ..precision import _dtype, settings
 from ._kernels import adam_update, momentum_update, state_sizes, weight_update
 from ._orthogonalize import METHODS
@@ -25,7 +22,7 @@ def _use_muon(param, group):
     return param.ndim >= 2 if group["use_muon"] is None else group["use_muon"]
 
 
-class FP8Muon(torch.optim.Optimizer):
+class FP8Muon(MatrixOptimizer):
     """One FP8 momentum buffer plus FP32 scales; ordinary Optimizer.step().
 
     Matrices use Muon and vectors use AdamW by default. Set ``use_muon=False``
@@ -41,7 +38,8 @@ class FP8Muon(torch.optim.Optimizer):
                  block_shape=None, rounding="nearest", rounding_seed=0,
                  ns_steps=None, ns_method="standard", ns_backend="torch", ns_autotune=True,
                  adjust_lr_fn="match_rms_adamw",
-                 betas=(.9, .95), eps=1e-8, adam_state_dtype="fp32", skip_nonfinite=False):
+                 betas=(.9, .95), eps=1e-8, adam_state_dtype="fp32", skip_nonfinite=False,
+                 shard_state=True):
         tile_default, steps_default = _MODES[mode]
         policy = settings()
         defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum, nesterov=nesterov,
@@ -53,19 +51,11 @@ class FP8Muon(torch.optim.Optimizer):
             ns_backend=ns_backend, ns_autotune=ns_autotune,
             adjust_lr_fn=adjust_lr_fn, betas=betas, eps=eps, adam_state_dtype=_dtype(adam_state_dtype),
             master_rounding=policy["master_rounding"], master_rounding_seed=policy["master_rounding_seed"])
-        self.skip_nonfinite = skip_nonfinite
-        self.step_was_skipped = False
         self.observer = None
         self._workspace = {}
-        self._partition = None
-        super().__init__(params, defaults)
-        self.register_state_dict_post_hook(self._save_partition)
-        self.register_load_state_dict_pre_hook(self._before_load)
-        self.register_load_state_dict_post_hook(self._after_load)
+        super().__init__(params, defaults, shard_state=shard_state, skip_nonfinite=skip_nonfinite)
 
     def add_param_group(self, group):
-        assert self._partition is None or not self._partition.owners, \
-            "Add DTensor parameter groups before the first step or checkpoint."
         super().add_param_group(group)
         self._partition = None
         group = self.param_groups[-1]
@@ -96,23 +86,6 @@ class FP8Muon(torch.optim.Optimizer):
             warnings.warn(f"FP8Muon: {len(unaligned)} matrices have partial {group['granularity']} groups "
                           f"(e.g. {unaligned[:3]}). Original matrix shapes are kept; edge groups use valid elements.",
                           stacklevel=3)
-
-    @property
-    def partition(self):
-        if self._partition is None:
-            self._partition = MatrixPartition(p for group in self.param_groups for p in group["params"])
-        return self._partition
-
-    def _has_nonfinite(self):
-        bad = any(not torch.isfinite(p.grad.to_local() if isinstance(p.grad, DTensor) else p.grad).all()
-                  for group in self.param_groups for p in group["params"] if p.grad is not None)
-        # An explicitly requested skip must agree across ranks; otherwise one
-        # owner could leave its peers waiting in a gather or broadcast.
-        for mesh in self.partition.meshes:
-            flag = torch.tensor(int(bad), device=mesh.device_type, dtype=torch.int32)
-            dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=mesh.get_group())
-            bad = bool(flag.item())
-        return bad
 
     def _momentum(self, param, grad, state, group, key):
         shape = _shape(param, group)
@@ -166,84 +139,3 @@ class FP8Muon(torch.optim.Optimizer):
                         eps=group["eps"], step=state["step"] + 1,
                         rounding=group["master_rounding"], key=master_key)
         state["step"] += 1
-
-    @torch.no_grad()
-    def step(self, closure=None):
-        self.step_was_skipped = False
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
-        # No scan or skipped update by default: Inf/NaN propagates normally.
-        if self.skip_nonfinite and self._has_nonfinite():
-            self.step_was_skipped = True
-            return loss
-        index = 0
-        contexts = {}
-        for group in self.param_groups:
-            for param in group["params"]:
-                parameter_index = index
-                index += 1
-                if param.grad is None:
-                    continue
-                if isinstance(param, DTensor):
-                    contexts[param] = (group, parameter_index)
-                else:
-                    self._step_local(param, param.grad, self.state[param], group, parameter_index)
-        if contexts:
-            self._step_distributed(contexts)
-        return loss
-
-    def _step_distributed(self, contexts):
-        for batch in self.partition.batches:
-            self._step_batch(batch, contexts)
-
-    def _step_batch(self, batch, contexts):
-        # Keep temporary lifetimes within this call; a previous round's final
-        # loop variables must not retain its full tensors during the next round.
-        work = []
-        for param in batch:
-            if param not in contexts:
-                continue
-            grad = param.grad
-            assert isinstance(grad, DTensor) and grad.device_mesh == param.device_mesh
-            owner = self.partition.owner(param)
-            full_grad = gather_to_owner(grad, owner)
-            full_param = gather_to_owner(param, owner)
-            if full_param is not None:
-                full_param = full_param.contiguous()
-            work.append((param, full_param, full_grad, owner))
-        # Every owner now has one tensor. Complete all local updates before
-        # synchronizing this round, so NS runs on multiple GPUs at once.
-        for param, full_param, full_grad, _ in work:
-            if full_param is not None:
-                group, index = contexts[param]
-                self._step_local(full_param, full_grad.contiguous(), self.state[param], group, index)
-        for param, full_param, _, owner in work:
-            write_from_owner(param, full_param, owner)
-
-    def _save_partition(self, optimizer, state):
-        if self.partition.owners:
-            state["viola_dtensor"] = self.partition.state_dict()
-        return state
-
-    def _before_load(self, optimizer, saved):
-        saved = dict(saved)
-        layout = saved.pop("viola_dtensor", {})
-        assert layout == self.partition.state_dict(), \
-            "Rank-local Muon checkpoints require the same mesh, layouts and parameter order."
-        # PyTorch casts optimizer tensor states to parameter dtype. Remove the
-        # packed bytes/scales/moments first, preserving their independent dtypes.
-        names = {"momentum_q", "momentum_scale", "momentum_buffer", "exp_avg", "exp_avg_sq"}
-        self._loading = {pid: {k: v for k, v in state.items() if k in names}
-                         for pid, state in saved["state"].items()}
-        self._loading_groups = saved["param_groups"]
-        return dict(saved, state={pid: {k: v for k, v in state.items() if k not in names}
-                                  for pid, state in saved["state"].items()})
-
-    def _after_load(self, optimizer):
-        for old, group in zip(self._loading_groups, self.param_groups):
-            for pid, param in zip(old["params"], group["params"]):
-                for name, value in self._loading.get(pid, {}).items():
-                    self.state[param][name] = value.to(device=param.device)
-        del self._loading, self._loading_groups
